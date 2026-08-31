@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -7,7 +8,7 @@ use std::thread;
 use cef::*;
 use serde_json::json;
 
-use crate::app::logger;
+use crate::app::{build_info, logger};
 use crate::jellyfin::bridge::{self as jellyfin_bridge, PlaybackContext};
 use crate::maintenance::player_setup::{self as mpv_setup, MpvSetupPhase};
 use crate::maintenance::updater::{self, UpdateRelease};
@@ -188,6 +189,15 @@ fn current_exe_path() -> Option<PathBuf> {
 fn cef_string_from_path(path: Option<&PathBuf>) -> CefString {
     path.map(|path| CefString::from(path.to_string_lossy().as_ref()))
         .unwrap_or_default()
+}
+
+fn linux_desktop_id() -> CefString {
+    // The generated CEF wrapper writes borrowed string structs to the native
+    // callback output. Keep the allocation alive for CEF's window creation.
+    let owned = CefString::from(build_info::APP_DESKTOP_ID);
+    let borrowed = owned.clone();
+    std::mem::forget(owned);
+    borrowed
 }
 
 fn platform_data_dir() -> PathBuf {
@@ -475,6 +485,20 @@ wrap_window_delegate! {
     impl PanelDelegate {}
 
     impl WindowDelegate {
+        fn linux_window_properties(
+            &self,
+            _window: Option<&mut Window>,
+            properties: Option<&mut LinuxWindowProperties>,
+        ) -> i32 {
+            let Some(properties) = properties else {
+                return 0;
+            };
+            properties.wayland_app_id = linux_desktop_id();
+            properties.wm_class_class = linux_desktop_id();
+            properties.wm_class_name = linux_desktop_id();
+            1
+        }
+
         fn on_window_created(&self, window: Option<&mut Window>) {
             let Some(window) = window else {
                 return;
@@ -618,11 +642,35 @@ fn should_minimize_instead_of_close(state: Option<&BrowserState>) -> bool {
         })
 }
 
+#[derive(Debug, Clone)]
+struct JellyfinRequestContext {
+    server_base: String,
+    headers: Vec<HttpHeader>,
+}
+
+#[derive(Debug, Default)]
+struct JellyfinRequestRegistry {
+    by_item: HashMap<String, JellyfinRequestContext>,
+    latest: Option<JellyfinRequestContext>,
+}
+
+impl JellyfinRequestRegistry {
+    fn remember(&mut self, item_id: String, context: JellyfinRequestContext) {
+        self.by_item.insert(item_id, context.clone());
+        self.latest = Some(context);
+    }
+
+    fn for_item(&self, item_id: &str) -> Option<&JellyfinRequestContext> {
+        self.by_item.get(item_id).or(self.latest.as_ref())
+    }
+}
+
 struct BrowserStateInner {
     title: String,
     settings: AppSettings,
     browsers: Vec<Browser>,
     playback_contexts: PlaybackContextRegistry,
+    jellyfin_requests: JellyfinRequestRegistry,
     playback: Arc<PlaybackCoordinator>,
     playback_event_tx: mpsc::Sender<PlaybackEvent>,
     update_available: Option<UpdateRelease>,
@@ -645,6 +693,7 @@ fn new_browser_state(title: String, settings: AppSettings) -> BrowserState {
         settings,
         browsers: Vec::new(),
         playback_contexts: PlaybackContextRegistry::default(),
+        jellyfin_requests: JellyfinRequestRegistry::default(),
         playback,
         playback_event_tx,
         update_available: None,
@@ -1558,6 +1607,17 @@ wrap_resource_request_handler! {
                 return ReturnValue::CANCEL;
             }
 
+            if let Some((server_base, item_id)) = jellyfin_item_request(&request_url) {
+                remember_jellyfin_request(
+                    &self.state,
+                    item_id,
+                    JellyfinRequestContext {
+                        server_base,
+                        headers: request_headers(request),
+                    },
+                );
+            }
+
             let Some(mut launch) = jellyfin_bridge::launch_from_stream_url(
                 &request_url,
                 request_headers(request),
@@ -2081,6 +2141,25 @@ fn remember_playback_context(query: &str, state: &BrowserState) {
     playback.update_context(context);
 }
 
+fn remember_jellyfin_request(
+    state: &BrowserState,
+    item_id: String,
+    context: JellyfinRequestContext,
+) {
+    let Ok(mut state) = state.lock() else {
+        tracing::warn!(target: "bridge", "failed to lock browser state while remembering Jellyfin request");
+        return;
+    };
+    tracing::trace!(
+        target: "bridge",
+        item_id,
+        server = %context.server_base,
+        headers = %logger::redacted_header_summary(&context.headers),
+        "remembering authenticated Jellyfin item request"
+    );
+    state.jellyfin_requests.remember(item_id, context);
+}
+
 fn start_playback_from_bridge_payload(query: &str, state: &BrowserState) {
     let mut launch = match jellyfin_bridge::parse_launch_payload(query) {
         Ok(launch) => launch,
@@ -2089,23 +2168,160 @@ fn start_playback_from_bridge_payload(query: &str, state: &BrowserState) {
             return;
         }
     };
-    if launch.media_url.trim().is_empty() {
-        tracing::warn!(target: "bridge", "ignored mpv launch payload with empty media URL");
-        return;
-    }
     tracing::debug!(
         target: "bridge",
         launch = %logger::launch_summary(&launch),
         "received mpv launch payload from bridge"
     );
     let merge_score = merge_recent_playback_context(state, &mut launch);
+    let reconstructed = reconstruct_jellyfin_stream_url(state, &mut launch);
+    if launch.media_url.trim().is_empty() {
+        tracing::warn!(
+            target: "bridge",
+            item_id = %display_opt(launch.item_id.as_deref()),
+            media_source_id = %display_opt(launch.media_source_id.as_deref()),
+            "ignored mpv launch payload because no stream URL could be resolved"
+        );
+        return;
+    }
     tracing::debug!(
         target: "bridge",
         merge_score = ?merge_score,
+        reconstructed,
         launch = %logger::launch_summary(&launch),
         "launch payload ready for mpv handoff"
     );
     let _ = hand_off_to_player(state, launch);
+}
+
+fn reconstruct_jellyfin_stream_url(state: &BrowserState, launch: &mut PlaybackRequest) -> bool {
+    if !launch.media_url.trim().is_empty() {
+        return false;
+    }
+    let Some(item_id) = launch
+        .item_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    let Some(media_source_id) = launch
+        .media_source_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    let context = match state.lock() {
+        Ok(state) => state.jellyfin_requests.for_item(item_id).cloned(),
+        Err(_) => {
+            tracing::warn!(target: "bridge", "failed to lock browser state while resolving Jellyfin stream URL");
+            None
+        }
+    };
+    let Some(context) = context else {
+        return false;
+    };
+
+    let container = playback_container(launch);
+    launch.media_url = format!(
+        "{}/Videos/{}/stream.{}?Static=true&mediaSourceId={}",
+        context.server_base.trim_end_matches('/'),
+        percent_encode_component(item_id),
+        container,
+        percent_encode_component(media_source_id),
+    );
+    if launch.headers.is_empty() {
+        launch.headers = context.headers;
+    }
+    tracing::debug!(
+        target: "bridge",
+        item_id,
+        media_source_id,
+        container,
+        url = %logger::redact_url_secrets(&launch.media_url),
+        "reconstructed direct Jellyfin stream URL from browser request context"
+    );
+    true
+}
+
+fn playback_container(launch: &PlaybackRequest) -> String {
+    fn find_container(value: &serde_json::Value) -> Option<&str> {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .find(|(key, value)| key.eq_ignore_ascii_case("container") && value.is_string())
+                .and_then(|(_, value)| value.as_str())
+                .or_else(|| map.values().find_map(find_container)),
+            serde_json::Value::Array(values) => values.iter().find_map(find_container),
+            _ => None,
+        }
+    }
+
+    launch
+        .details
+        .as_ref()
+        .and_then(find_container)
+        .and_then(|value| value.split(',').next())
+        .map(|value| {
+            value
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "mkv".to_string())
+}
+
+fn jellyfin_item_request(url: &str) -> Option<(String, String)> {
+    let lower = url.to_ascii_lowercase();
+    let scheme_end = lower.find("://")? + 3;
+    if !matches!(&lower[..scheme_end - 3], "http" | "https") {
+        return None;
+    }
+    let path_start = lower[scheme_end..]
+        .find('/')
+        .map(|index| scheme_end + index)?;
+    let path_end = lower[path_start..]
+        .find(['?', '#'])
+        .map(|index| path_start + index)
+        .unwrap_or(url.len());
+    let path = &lower[path_start..path_end];
+
+    let (base_end, item_start) = if let Some(users_at) = path.find("/users/") {
+        let items_relative = path[users_at + 7..].find("/items/")?;
+        let items_at = users_at + 7 + items_relative;
+        (path_start + users_at, path_start + items_at + 7)
+    } else if let Some(items_at) = path.find("/items/") {
+        (path_start + items_at, path_start + items_at + 7)
+    } else {
+        return None;
+    };
+    let item_end = lower[item_start..path_end]
+        .find('/')
+        .map(|index| item_start + index)
+        .unwrap_or(path_end);
+    let item_id = percent_decode(&url[item_start..item_end]);
+    if item_id.trim().is_empty() {
+        return None;
+    }
+    Some((url[..base_end].trim_end_matches('/').to_string(), item_id))
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 
 fn handle_player_command(query: &str, state: &BrowserState) {
@@ -2741,7 +2957,8 @@ fn html_escape(value: &str) -> String {
 mod tests {
     use super::{
         bridge_token_is_valid, escape_js_line_separators, html_escape, is_browser_openable_url,
-        is_safe_external_link, js_string_literal, percent_decode, same_web_origin, url_scheme,
+        is_safe_external_link, jellyfin_item_request, js_string_literal, percent_decode,
+        percent_encode_component, same_web_origin, url_scheme,
     };
 
     #[test]
@@ -2903,5 +3120,38 @@ mod tests {
         assert_eq!(percent_decode("%2Fpath%2F"), "/path/");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn jellyfin_item_request_finds_server_and_item_for_supported_api_routes() {
+        assert_eq!(
+            jellyfin_item_request(
+                "https://jellyfin.example/base/Users/user-id/Items/item-id?Fields=Path"
+            ),
+            Some((
+                "https://jellyfin.example/base".to_string(),
+                "item-id".to_string()
+            ))
+        );
+        assert_eq!(
+            jellyfin_item_request("http://192.168.1.5:8096/Items/encoded%20item/PlaybackInfo"),
+            Some((
+                "http://192.168.1.5:8096".to_string(),
+                "encoded item".to_string()
+            ))
+        );
+        assert_eq!(
+            jellyfin_item_request("https://jellyfin.example/Users/user-id/Items?Limit=20"),
+            None
+        );
+    }
+
+    #[test]
+    fn percent_encode_component_keeps_ids_safe_in_stream_urls() {
+        assert_eq!(percent_encode_component("abc-123_def"), "abc-123_def");
+        assert_eq!(
+            percent_encode_component("source id/one"),
+            "source%20id%2Fone"
+        );
     }
 }

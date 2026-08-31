@@ -21,6 +21,8 @@
   const externalizedByPlaySession = new Map();
   const externalizedMedia = new WeakMap();
   const externalizedSources = new WeakMap();
+  const serverByItem = new Map();
+  const tokenByServer = new Map();
   const syntheticMediaState = new WeakMap();
   const syntheticMediaElements = new Set();
   const playerInstances = new Set();
@@ -93,6 +95,208 @@
   function parsedUrl(value) {
     try { return new URL(absoluteUrl(value)); }
     catch (_) { return null; }
+  }
+
+  function serverBaseFromApiUrl(value) {
+    const url = parsedUrl(value);
+    if (!url) return '';
+    const match = url.pathname.match(/\/(?:Users\/[^/]+\/Items|Items)\//i);
+    if (!match || match.index === undefined) return '';
+    return `${url.origin}${url.pathname.slice(0, match.index)}`.replace(/\/+$/, '');
+  }
+
+  function itemIdFromApiUrl(value) {
+    const url = parsedUrl(value);
+    if (!url) return '';
+    const userItem = url.pathname.match(/\/Users\/[^/]+\/Items\/([^/?#]+)/i);
+    if (userItem) return decodeURIComponent(userItem[1]);
+    const playbackInfo = url.pathname.match(/\/Items\/([^/?#]+)\/PlaybackInfo/i);
+    return playbackInfo ? decodeURIComponent(playbackInfo[1]) : '';
+  }
+
+  function tokenFromHeaders(headers) {
+    if (!headers) return '';
+    const entries = [];
+    try {
+      if (typeof headers.forEach === 'function') {
+        headers.forEach((value, name) => entries.push([name, value]));
+      } else if (Array.isArray(headers)) {
+        entries.push(...headers);
+      } else if (typeof headers === 'object') {
+        entries.push(...Object.entries(headers));
+      }
+    } catch (_) {}
+
+    for (const [rawName, rawValue] of entries) {
+      const name = String(rawName || '').toLowerCase();
+      const value = String(rawValue || '');
+      if (name === 'x-emby-token' || name === 'x-mediabrowser-token') return value;
+      if (name === 'authorization' || name === 'x-emby-authorization') {
+        const match = value.match(/\bToken\s*=\s*"?([^",\s]+)"?/i);
+        if (match) return match[1];
+      }
+    }
+    return '';
+  }
+
+  function rememberApiRequest(value, headers) {
+    const url = parsedUrl(value);
+    if (!url) return;
+    const serverBase = serverBaseFromApiUrl(url.href);
+    if (!serverBase) return;
+    const itemId = itemIdFromApiUrl(url.href);
+    if (itemId) serverByItem.set(String(itemId), serverBase);
+    const token = url.searchParams.get('ApiKey')
+      || url.searchParams.get('api_key')
+      || tokenFromHeaders(headers);
+    if (token) tokenByServer.set(serverBase, token);
+  }
+
+  function playbackServerId(item, options) {
+    const direct = item?.ServerId
+      || item?.serverId
+      || options?.serverId
+      || options?.ServerId
+      || '';
+    if (direct) return String(direct);
+    try {
+      const query = String(location.hash || '').split('?')[1] || '';
+      return new URLSearchParams(query).get('serverId') || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function storedServerContext(serverId) {
+    if (!serverId || typeof localStorage === 'undefined') return null;
+    const visited = new Set();
+    const findServer = (value, depth = 0) => {
+      if (!value || typeof value !== 'object' || depth > 8 || visited.has(value)) return null;
+      visited.add(value);
+      if (String(value.Id || value.id || '') === String(serverId)) {
+        const serverBase = value.ManualAddress
+          || value.RemoteAddress
+          || value.Address
+          || value.LocalAddress
+          || '';
+        const token = value.AccessToken || value.accessToken || '';
+        if (/^https?:\/\//i.test(String(serverBase)) && token) {
+          return { serverBase: String(serverBase).replace(/\/+$/, ''), token: String(token) };
+        }
+      }
+      for (const child of Array.isArray(value) ? value : Object.values(value)) {
+        const match = findServer(child, depth + 1);
+        if (match) return match;
+      }
+      return null;
+    };
+
+    try {
+      for (let index = 0; index < localStorage.length; index += 1) {
+        const key = localStorage.key(index);
+        if (!key) continue;
+        const raw = localStorage.getItem(key);
+        if (!raw || !raw.includes(serverId)) continue;
+        try {
+          const match = findServer(JSON.parse(raw));
+          if (match) return match;
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function apiClientValue(client, name) {
+    try {
+      const value = client?.[name];
+      return typeof value === 'function' ? value.call(client) : value;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function fallbackPlaybackUrl(item, mediaSource, options = {}) {
+    const supplied = mediaSource?.TranscodingUrl
+      || mediaSource?.transcodingUrl
+      || mediaSource?.DirectStreamUrl
+      || mediaSource?.directStreamUrl
+      || options?.transcodingUrl
+      || options?.TranscodingUrl
+      || options?.directStreamUrl
+      || options?.DirectStreamUrl
+      || '';
+    if (supplied) {
+      const client = globalThis.ApiClient;
+      if (/^https?:\/\//i.test(String(supplied))) return String(supplied);
+      try {
+        const resolved = client?.getUrl?.(String(supplied).replace(/^\/+/, ''));
+        if (typeof resolved === 'string' && resolved) return resolved;
+      } catch (_) {}
+      return absoluteUrl(supplied);
+    }
+
+    const itemId = item?.Id || item?.id || options?.itemId || options?.ItemId || '';
+    const mediaSourceId = mediaSource?.Id
+      || mediaSource?.MediaSourceId
+      || mediaSource?.id
+      || options?.mediaSourceId
+      || options?.MediaSourceId
+      || '';
+    if (!itemId || !mediaSourceId) return '';
+    if (mediaSource?.SupportsDirectPlay === false && mediaSource?.SupportsDirectStream === false) return '';
+
+    const remotePath = mediaSource?.Path || mediaSource?.path || '';
+    if (/^https?:\/\//i.test(String(remotePath))) return String(remotePath);
+
+    const mediaType = String(item?.MediaType || item?.mediaType || options?.mediaType || options?.MediaType || 'Video').toLowerCase();
+    const routeType = mediaType === 'audio' ? 'Audio' : 'Videos';
+    const pathContainer = String(remotePath).match(/\.([a-z0-9]+)(?:[?#]|$)/i)?.[1] || '';
+    const container = String(mediaSource?.Container || mediaSource?.container || options?.container || options?.Container || pathContainer || (routeType === 'Audio' ? 'mka' : 'mkv'))
+      .split(',')[0]
+      .trim()
+      .replace(/[^a-z0-9]/gi, '') || (routeType === 'Audio' ? 'mka' : 'mkv');
+    const endpoint = `${routeType}/${encodeURIComponent(itemId)}/stream.${container}`;
+    const client = globalThis.ApiClient;
+    const rememberedServer = serverByItem.get(String(itemId)) || '';
+    const rememberedToken = rememberedServer ? tokenByServer.get(rememberedServer) || '' : '';
+    const storedServer = storedServerContext(playbackServerId(item, options));
+    const selectedServer = rememberedServer || storedServer?.serverBase || '';
+    const params = {
+      Static: true,
+      mediaSourceId,
+      deviceId: apiClientValue(client, 'deviceId') || undefined,
+      ApiKey: rememberedToken || storedServer?.token || apiClientValue(client, 'accessToken') || undefined,
+      Tag: mediaSource?.ETag || mediaSource?.etag || undefined
+    };
+
+    if (selectedServer) {
+      try {
+        const url = new URL(endpoint, `${selectedServer.replace(/\/+$/, '')}/`);
+        for (const [name, value] of Object.entries(params)) {
+          if (value !== undefined && value !== null && value !== '') url.searchParams.set(name, String(value));
+        }
+        return url.href;
+      } catch (_) {}
+    }
+
+    try {
+      const resolved = client?.getUrl?.(endpoint, params);
+      if (typeof resolved === 'string' && resolved) return resolved;
+    } catch (error) {
+      console.debug('[mediaflick-desktop] failed to construct direct stream URL through ApiClient', error);
+    }
+
+    const serverAddress = String(apiClientValue(client, 'serverAddress') || '');
+    if (!serverAddress) return '';
+    try {
+      const url = new URL(endpoint, `${serverAddress.replace(/\/+$/, '')}/`);
+      for (const [name, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null && value !== '') url.searchParams.set(name, String(value));
+      }
+      return url.href;
+    } catch (_) {
+      return '';
+    }
   }
 
   function itemIdFromPath(pathname) {
@@ -662,7 +866,10 @@
   }
 
   function sendExternalPlayback(context) {
-    if (!context || !context.mediaUrl) return;
+    // Some Jellyfin Web builds do not expose their resolved stream URL to the
+    // injected player shim. Still notify the native host: it can reconstruct
+    // the URL from the authenticated Jellyfin API requests it observes.
+    if (!context) return;
     try {
       const clean = Object.assign({}, context);
       delete clean.seenAt;
@@ -1090,10 +1297,10 @@
   }
 
   function contextFromPlayOptions(options) {
-    const rawUrl = options?.url || '';
-    const mediaUrl = rawUrl ? absoluteUrl(rawUrl) : '';
     const mediaSource = options?.mediaSource || {};
     const item = options?.item || {};
+    const rawUrl = options?.url || '';
+    const mediaUrl = rawUrl ? absoluteUrl(rawUrl) : fallbackPlaybackUrl(item, mediaSource, options);
     const startTimeTicks = numberish(
       options?.playerStartPositionTicks
         ?? options?.startTimeTicks
@@ -1803,6 +2010,8 @@
   if (typeof nativeFetch === 'function') {
     window.fetch = function(input, init) {
       const requestUrl = absoluteUrl(typeof input === 'string' || input instanceof URL ? input : input?.url);
+      rememberApiRequest(requestUrl, input?.headers);
+      rememberApiRequest(requestUrl, init?.headers);
       if (!isBridgeRelevantUrl(requestUrl)) {
         return nativeFetch.call(this, input, init);
       }
@@ -1835,10 +2044,12 @@
 
   const nativeOpen = XMLHttpRequest.prototype.open;
   const nativeSend = XMLHttpRequest.prototype.send;
+  const nativeSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.open = function(method, url) {
     this.__mediaFlickDesktopMethod = String(method || 'GET').toUpperCase();
     const absoluteRequestUrl = absoluteUrl(url);
     this.__mediaFlickDesktopUrl = patchPlaybackRequestUrl(absoluteRequestUrl);
+    rememberApiRequest(this.__mediaFlickDesktopUrl);
     if (isDirectStreamUrl(this.__mediaFlickDesktopUrl)) rememberForStream(this.__mediaFlickDesktopUrl);
     if (this.__mediaFlickDesktopUrl === absoluteRequestUrl) {
       return nativeOpen.apply(this, arguments);
@@ -1846,6 +2057,10 @@
     const args = Array.from(arguments);
     args[1] = this.__mediaFlickDesktopUrl;
     return nativeOpen.apply(this, args);
+  };
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    rememberApiRequest(this.__mediaFlickDesktopUrl, [[name, value]]);
+    return nativeSetRequestHeader.apply(this, arguments);
   };
   XMLHttpRequest.prototype.send = function(body) {
     if (!isBridgeRelevantUrl(this.__mediaFlickDesktopUrl)) {
