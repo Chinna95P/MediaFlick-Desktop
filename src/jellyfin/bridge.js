@@ -39,6 +39,8 @@
     createdBy: '{{created_by}}'
   };
   const nativeFetch = window.fetch;
+  const bridgeUrlQueue = [];
+  let bridgeUrlInFlight = false;
   let playerStateTimer = 0;
   let playerStateFrame = null;
   let playerStateRequestId = 0;
@@ -367,14 +369,14 @@
     return out;
   }
 
-  function remember(context) {
+  function remember(context, notifyNative = true) {
     if (!context) return;
     context.seenAt = Date.now();
     if (!context.title) context.title = document.title || '';
     if (context.itemId) contextsByItem.set(String(context.itemId), context);
     if (context.mediaSourceId) contextsByMediaSource.set(String(context.mediaSourceId), context);
     if (context.playSessionId) contextsByPlaySession.set(String(context.playSessionId), context);
-    sendContext(context);
+    if (notifyNative) sendContext(context);
     pruneContexts();
   }
 
@@ -865,6 +867,31 @@
     }
   }
 
+  function compactLaunchDetails(details) {
+    if (!details || typeof details !== 'object') return undefined;
+    const mediaSource = details.mediaSource || details.MediaSource || {};
+    const container = mediaSource.Container
+      || mediaSource.container
+      || details.Container
+      || details.container;
+    return container ? { Container: String(container) } : undefined;
+  }
+
+  function compactLaunchQueue(queue) {
+    if (!Array.isArray(queue)) return undefined;
+    const compact = queue.map(entry => {
+      if (!entry || typeof entry !== 'object') return null;
+      const itemId = entry.ItemId || entry.itemId || entry.Id || entry.id;
+      const playlistItemId = entry.PlaylistItemId || entry.playlistItemId;
+      if (!itemId && !playlistItemId) return null;
+      const out = {};
+      if (itemId) out.ItemId = String(itemId);
+      if (playlistItemId) out.PlaylistItemId = String(playlistItemId);
+      return out;
+    }).filter(Boolean);
+    return compact.length ? compact : undefined;
+  }
+
   function sendExternalPlayback(context) {
     // Some Jellyfin Web builds do not expose their resolved stream URL to the
     // injected player shim. Still notify the native host: it can reconstruct
@@ -874,6 +901,8 @@
       const clean = Object.assign({}, context);
       delete clean.seenAt;
       delete clean.externalizedAt;
+      clean.details = compactLaunchDetails(clean.details);
+      clean.queue = compactLaunchQueue(clean.queue);
       const key = [clean.mediaUrl || '', clean.playSessionId || '', clean.mediaSourceId || '', clean.itemId || '', clean.startTimeTicks || ''].join('|');
       const last = sentPlayKeys.get(key) || 0;
       if (Date.now() - last < 1000) return;
@@ -1131,12 +1160,24 @@
     });
   };
 
-  function fireBridgeUrl(url) {
+  function drainBridgeUrlQueue() {
+    if (bridgeUrlInFlight || bridgeUrlQueue.length === 0) return;
+    bridgeUrlInFlight = true;
+    const url = bridgeUrlQueue.shift();
+    let completed = false;
+    const complete = () => {
+      if (completed) return;
+      completed = true;
+      bridgeUrlInFlight = false;
+      setTimeout(drainBridgeUrlQueue, 0);
+    };
+
     // Never assign window.location for bridge calls: a top-level navigation to
     // mediaflick-desktop:// fires Jellyfin Web's beforeunload handler (which
     // stops and destroys the current player) before CEF cancels it, orphaning
-    // active mpv playback. A no-cors fetch is a subresource request and does
-    // not unload the page.
+    // active mpv playback. Serialize no-cors subresource requests because CEF
+    // can discard a second custom-scheme fetch while the first is being
+    // cancelled by the native request handler.
     if (typeof nativeFetch === 'function') {
       try {
         nativeFetch.call(window, url, {
@@ -1145,15 +1186,26 @@
           cache: 'no-store',
           credentials: 'omit',
           keepalive: true
-        }).catch(() => {});
+        }).then(complete, complete);
+        // A custom-scheme fetch normally rejects as soon as CEF handles it,
+        // but do not let an unsettled promise block later player commands.
+        setTimeout(complete, 250);
         return;
       } catch (_) {}
     }
     const image = new Image();
+    image.onload = complete;
+    image.onerror = complete;
     image.src = url;
     setTimeout(() => {
       image.src = '';
+      complete();
     }, 1000);
+  }
+
+  function fireBridgeUrl(url) {
+    bridgeUrlQueue.push(url);
+    drainBridgeUrlQueue();
   }
 
   function sendBridgeRequest(action, payload) {
@@ -1658,7 +1710,12 @@
       this._currentPlayOptions = options;
 
       const context = contextFromPlayOptions(options);
-      remember(context);
+      // The launch payload already contains the complete playback context. Keep
+      // it in the web-side registries, but send only the play request here.
+      // Sending play-context and play as consecutive custom-scheme fetches can
+      // cause CEF to discard the latter. URL-less providers such as Gelato have
+      // no later stream-resource request from which playback can recover.
+      remember(context, false);
       markExternalized(context);
       sendExternalPlayback(context);
 

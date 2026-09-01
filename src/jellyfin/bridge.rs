@@ -367,6 +367,12 @@ mod tests {
         assert!(script.contains("\"maxStreamingBitrate\":10000000"));
         assert!(script.contains("if (!isPlaybackInfoUrl(value) && !isLiveStreamOpenUrl(value))"));
         assert!(script.contains("{ Format, Method: 'External' }"));
+        assert!(script.contains("remember(context, false);"));
+        assert!(script.contains("sendExternalPlayback(context);"));
+        assert!(script.contains("const bridgeUrlQueue = [];"));
+        assert!(script.contains("setTimeout(complete, 250);"));
+        assert!(script.contains("clean.details = compactLaunchDetails(clean.details);"));
+        assert!(script.contains("clean.queue = compactLaunchQueue(clean.queue);"));
         assert!(!script.contains("__MEDIAFLICK_PLAYBACK_SETTINGS_JSON__"));
 
         let update = bridge_settings_script(&settings);
