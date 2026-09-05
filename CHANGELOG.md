@@ -4,6 +4,19 @@
 
 ### Breaking Changes
 
+### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+
+## [0.1.6-chinna3] - 2026-09-05
+
+### Breaking Changes
+
 - Replaced the embedded Jellyfin Web client with MediaFlick Desktop's own UI. The app now signs in to Jellyfin and loads its login, home, library, and details views from `mediaflick-desktop://app/`. Existing users keep their server URL but must sign in again. The "Open Jellyfin dashboard" context-menu item opens server administration in the system browser.
 - Removed the jellyfin-web injection bridge, including `bridge.js` and stream-URL interception. Native code now negotiates playback through `PlaybackInfo` and sends it directly to mpv or MPC-HC. Scripts and workflows that used the injected `window.__mediaFlickDesktop*` hooks no longer work. The native About and update dialogs still use the shell bridge.
 - Removed the welcome and setup screen. Users now enter the server address on the sign-in screen and configure the media player in Settings.
@@ -222,8 +235,6 @@
 - Removed an unused separator component and stopped exporting TypeScript symbols with no external users.
 - Removed Desktop provider credentials. MDBList ratings now require the Companion `ratings-v1` capability, and Desktop no longer exposes MDBList or TMDB credential routes, stores provider keys in the operating-system vault, or calls MDBList directly.
 - Removed Desktop's direct Seerr client, setup dialog, address and password endpoints, Quick Connect approval, session cookies, SQLite configuration, and `--seerr-status` command. Seerr now requires a compatible Companion capability and Jellyfin-to-Seerr user mapping.
-
-
 ## [0.1.6] - 2026-07-16
 
 ### Added
