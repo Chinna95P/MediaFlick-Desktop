@@ -1,10 +1,11 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { DEFAULT_COMFORT } from "@/lib/viewing"
 import { act, fireEvent, render, screen } from "@testing-library/react"
-import { MemoryRouter } from "react-router-dom"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { AppShell } from "@/components/AppShell"
 import type { ClientSettings, PlayerState } from "@/lib/api"
 import { queryKeys } from "@/lib/query-client"
+import { testQueryClient } from "./test-query-client"
+import { TestProviders } from "./test-utils"
 
 const settings = {
   client: {
@@ -16,7 +17,7 @@ const settings = {
       markWatchedNext: "w",
       playerConfigured: true,
     },
-    playback: {
+    playback: { comfort: DEFAULT_COMFORT,
       streamingQuality: "auto",
       skipIntro: "disabled",
       skipCredits: "disabled",
@@ -73,9 +74,7 @@ describe("integrated libmpv overlay", () => {
         dispatchEvent: () => false,
       })),
     )
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
-    })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, settings)
     client.setQueryData<PlayerState>(queryKeys.playerState, {
       active: true,
@@ -86,13 +85,11 @@ describe("integrated libmpv overlay", () => {
     })
 
     const view = render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter>
+      <TestProviders client={client}>
           <AppShell>
             <div>Library chrome</div>
           </AppShell>
-        </MemoryRouter>
-      </QueryClientProvider>,
+      </TestProviders>,
     )
 
     expect(screen.getByLabelText("MediaFlick")).not.toBeNull()

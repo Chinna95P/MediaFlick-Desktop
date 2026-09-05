@@ -1,11 +1,14 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { act, fireEvent, render, screen, within } from "@testing-library/react"
-import { MemoryRouter, useLocation } from "react-router-dom"
+import { api } from "@/lib/api"
+import { DEFAULT_COMFORT, DEFAULT_VIEWING } from "@/lib/viewing"
+import { act, fireEvent, render, screen, within, waitFor } from "@testing-library/react"
+import { Route, Routes, useLocation } from "react-router-dom"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 import type { ClientSettings, RatingsIntegrationStatus } from "@/lib/api"
 import { queryKeys } from "@/lib/query-client"
-import { Appearance } from "@/routes/Settings"
+import Settings, { Appearance } from "@/routes/Settings"
 import { itemSummary, requireElement } from "./support/fixtures"
+import { testQueryClient } from "./test-query-client"
+import { TestProviders } from "./test-utils"
 
 const appearance = (cardPreviews: boolean): ClientSettings["appearance"] => ({
   theme: "light",
@@ -29,7 +32,7 @@ const settings = (cardPreviews: boolean): ClientSettings => ({
       markWatchedNext: null,
       playerConfigured: true,
     },
-    playback: {
+    playback: { comfort: DEFAULT_COMFORT,
       streamingQuality: "original",
       skipIntro: "disabled",
       skipCredits: "disabled",
@@ -61,16 +64,13 @@ function LocationProbe() {
 }
 
 function renderAppearance(cardPreviews: boolean, authenticated = true) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
-  })
+  const client = testQueryClient()
   client.setQueryData(queryKeys.settings, settings(cardPreviews))
+  client.setQueryData(["viewing", "anonymous:anonymous"], DEFAULT_VIEWING)
   client.setQueryData(queryKeys.status, { authenticated })
   client.setQueryData(queryKeys.home, {
-    rows: [
-      { id: "resume", title: "Continue Watching", items: [] },
-      { id: "recent", title: "Recently Added", items: [movie] },
-    ],
+    continueWatching: [],
+    rows: [{ kind: "builtIn", id: "recentlyAdded", title: "Recently Added", items: [movie] }],
   })
   client.setQueryData(queryKeys.ratingsStatus, ratingsStatus)
   const requests: string[] = []
@@ -79,12 +79,10 @@ function renderAppearance(cardPreviews: boolean, authenticated = true) {
     return new Response(JSON.stringify({}), { status: 200 })
   }))
   render(
-    <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={["/settings/appearance"]}>
+    <TestProviders client={client} initialEntries={["/settings/appearance"]}>
         <Appearance />
         <LocationProbe />
-      </MemoryRouter>
-    </QueryClientProvider>,
+    </TestProviders>,
   )
   return requests
 }
@@ -92,6 +90,32 @@ function renderAppearance(cardPreviews: boolean, authenticated = true) {
 function location() {
   return document.querySelector("[data-location]")?.textContent
 }
+
+test("appearance sliders expose names, descriptions, and percentage values", () => {
+  renderAppearance(false)
+  for (const [name, value] of [["Artwork intensity", "80 percent"], ["Backdrop intensity", "60 percent"]]) {
+    const slider = screen.getByRole("slider", { name })
+    expect(slider.getAttribute("aria-valuetext")).toBe(value)
+    expect(document.getElementById(slider.getAttribute("aria-describedby") ?? "")?.textContent).toContain("%")
+  }
+})
+
+test.each(["mpv", "mpchc"] as const)("%s player fields are associated with visible labels and help", (backend) => {
+  const client = testQueryClient()
+  const configured = settings(false)
+  configured.client.player.playerBackend = backend
+  configured.capabilities.mpchc = true
+  client.setQueryData(queryKeys.settings, configured)
+  client.setQueryData(queryKeys.status, { authenticated: true })
+  render(<TestProviders client={client} initialEntries={["/settings/client/player"]}>
+    <Routes><Route path="/settings/*" element={<Settings />} /></Routes>
+  </TestProviders>)
+  const names = backend === "mpv" ? ["Mark watched key", "mpv executable"] : ["MPC-HC executable"]
+  for (const name of names) {
+    const input = screen.getByRole("textbox", { name })
+    expect(document.getElementById(input.getAttribute("aria-describedby") ?? "")?.textContent).toBeTruthy()
+  }
+})
 
 function hoverWithMouse(element: Element) {
   const event = new MouseEvent("pointerover", { bubbles: true })
@@ -188,4 +212,30 @@ describe("appearance settings live preview", () => {
     // The quick actions stay on the card instead, revealed by the same hover.
     expect(document.querySelector(".appearance-preview-shelf .card-inline-actions")).not.toBeNull()
   })
+})
+
+
+test("preview delay shares the preview toggle's Save, Reset, and Discard workflow", async () => {
+  vi.useRealTimers()
+  renderAppearance(false)
+  const input = screen.getByRole("spinbutton", {name:"Card preview delay"}) as HTMLInputElement
+  expect(input.disabled).toBe(true)
+  fireEvent.click(screen.getByRole("switch", {name:"Show pop-out previews on cards"}))
+  expect(input.disabled).toBe(false)
+  fireEvent.change(input, {target:{value:"850"}})
+  fireEvent.click(screen.getByRole("button", {name:"Discard"}))
+  expect(input.value).toBe("550")
+  expect(input.disabled).toBe(true)
+  fireEvent.click(screen.getByRole("switch", {name:"Show pop-out previews on cards"}))
+  fireEvent.change(input, {target:{value:"850"}})
+  vi.spyOn(api.settingsPatch, "appearance").mockImplementation(async (appearance) => ({...settings(true), appearance: {...settings(true).appearance, ...appearance}}))
+  vi.spyOn(api, "viewing").mockResolvedValue({...DEFAULT_VIEWING, textScale:125})
+  const save = vi.spyOn(api, "saveViewing").mockImplementation(async (value) => value)
+  fireEvent.click(screen.getByRole("button", {name:"Save"}))
+  await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({previewDelayMs:850, textScale:125})))
+  await waitFor(() => expect((screen.getByRole("button", {name:"Save"}) as HTMLButtonElement).disabled).toBe(true))
+  fireEvent.click(screen.getByRole("button", {name:"Reset"}))
+  expect(input.value).toBe("550")
+  fireEvent.click(screen.getByRole("button", {name:"Discard"}))
+  expect(input.value).toBe("850")
 })

@@ -1,11 +1,17 @@
-import { useMutation, useQuery } from "@tanstack/react-query"
+import { SubtitlePreview } from "@/components/SubtitlePreview"
+import { DEFAULT_VIEWING, DEFAULT_COMFORT, useViewing } from "@/lib/viewing"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   CheckCircle2,
   Download,
   ExternalLink,
   Film,
   FolderOpen,
+  GripVertical,
+  House,
   Link,
   Layers,
   Monitor,
@@ -13,10 +19,8 @@ import {
   Play,
   Plug,
   RefreshCw,
-  Save,
   SlidersHorizontal,
   Trash2,
-  Undo2,
   type LucideIcon,
 } from "lucide-react"
 import {
@@ -31,14 +35,18 @@ import {
   type MouseEvent,
   type ReactNode,
 } from "react"
+import { createPortal } from "react-dom"
 import { Link as RouterLink, Navigate, Route, Routes, useLocation } from "react-router-dom"
 import { toast } from "sonner"
 import { MediaCard } from "@/components/MediaCard"
 import { PreviewProvider, type PreviewDependencies } from "@/components/PreviewCard"
+import SaveBar from "@/components/SettingsSaveBar"
+import SettingsDraftGuard from "@/components/SettingsDraftGuard"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
@@ -53,17 +61,21 @@ import {
 import {
   api,
   ApiError,
+  homeSettingsWrite,
   playerSettingsWrite,
   type AppearanceSettings,
+  type ViewingSettings,
   type ClientSettings,
   type CompanionService,
+  type HomeConfiguration,
   type LetterboxdProfile,
   type RatingSourceDefinition,
+  type Status,
 } from "@/lib/api"
 import { jsonNumber, jsonString } from "@/lib/json"
 import { queryClient, queryKeys, removeAccountQueryData } from "@/lib/query-client"
 import { RatingsContext, type RatingsContextValue } from "@/lib/rating-context"
-import { useCompanion, useHome, useItem, useNextUp, useRatingsStatus, useSeerrStatus, useSettings, useStatus } from "@/lib/queries"
+import { collectionAccountKey, useCompanion, useHome, useHomeSettings, useItem, useNextUp, useRatingsStatus, useSeerrStatus, useSettings, useStatus } from "@/lib/queries"
 import { usePrefersReducedMotion } from "@/lib/reduced-motion"
 import { readShellEvent, type ShellEvent } from "@/lib/shell-events"
 import type { CSSVariableProperties } from "@/lib/style"
@@ -81,6 +93,8 @@ const NAVIGATION: SettingsPage[] = [
   { to: "/settings/client/player", title: "Player", icon: Play, group: "Client" },
   { to: "/settings/client/playback", title: "Playback", icon: SlidersHorizontal, group: "Client" },
   { to: "/settings/client/application", title: "Application", icon: Monitor, group: "Client" },
+  { to: "/settings/viewing", title: "Viewing", icon: SlidersHorizontal, signedIn: true, group: "Account" },
+  { to: "/settings/home", title: "Home", icon: House, signedIn: true, group: "Account" },
   { to: "/settings/appearance", title: "Appearance", icon: Palette, signedIn: true, group: "Account" },
   { to: "/settings/collections", title: "Collections", icon: Layers, signedIn: true, group: "Account" },
   { to: "/settings/integrations/companion", title: "MediaFlick Companion", icon: Plug, signedIn: true, group: "Integrations" },
@@ -99,17 +113,19 @@ function saveSettings(saved: ClientSettings, message = "Settings saved") {
 function SettingsRow({
   title,
   description,
+  controlId,
   children,
 }: {
   title: string
-  description: string
+  description?: string
+  controlId?: string
   children: ReactNode
 }) {
   return (
     <div className="settings-row">
       <div className="min-w-0">
-        <h3 className="font-medium">{title}</h3>
-        <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+        <h3 className="font-medium">{controlId ? <Label htmlFor={controlId}>{title}</Label> : title}</h3>
+        {description && <p id={controlId ? `${controlId}-help` : undefined} className="mt-1 text-sm text-muted-foreground">{description}</p>}
       </div>
       <div className="settings-control">{children}</div>
     </div>
@@ -203,31 +219,7 @@ function SelectField<const Value extends string>({
   )
 }
 
-function SaveBar({ dirty, saving, onSave, onDiscard, onReset, restartMessage }: {
-  dirty: boolean
-  saving: boolean
-  onSave: () => void
-  onDiscard: () => void
-  onReset: () => void
-  restartMessage?: string
-}) {
-  if (!dirty) return null
-  return (
-    <div className="settings-save-bar">
-      <div className="flex min-w-0 items-center gap-2 text-sm">
-        {restartMessage && <AlertTriangle className="size-4 shrink-0 text-primary" />}
-        <span>{restartMessage ?? "You have unsaved changes."}</span>
-      </div>
-      <div className="flex shrink-0 gap-2">
-        <Button variant="ghost" size="sm" onClick={onReset} disabled={saving}><Undo2 /> Reset</Button>
-        <Button variant="outline" size="sm" onClick={onDiscard} disabled={saving}>Discard</Button>
-        <Button size="sm" onClick={onSave} disabled={saving}><Save /> {saving ? "Saving…" : "Save"}</Button>
-      </div>
-    </div>
-  )
-}
-
-function Section({ title, description, children }: { title: string; description: string; children: ReactNode }) {
+function Section({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
   return (
     <Card>
       <CardHeader>
@@ -246,7 +238,7 @@ function SettingsLoading() {
 function SettingsError({ title = "Settings unavailable", error, onRetry }: { title?: string; error: Error; onRetry: () => void }) {
   return (
     <div className="settings-page">
-      <PageTitle title={title} detail="MediaFlick could not load the saved state for this page." />
+      <PageTitle title={title} />
       <Section title="Could not load settings" description={error.message}>
         <Button variant="outline" onClick={onRetry}><RefreshCw /> Try again</Button>
       </Section>
@@ -254,8 +246,8 @@ function SettingsError({ title = "Settings unavailable", error, onRetry }: { tit
   )
 }
 
-function PageTitle({ title, detail }: { title: string; detail: string }) {
-  return <header className="settings-page-title"><h1>{title}</h1><p>{detail}</p></header>
+function PageTitle({ title }: { title: string }) {
+  return <header className="settings-page-title"><h1>{title}</h1></header>
 }
 
 function useShellEvents(listener: (event: ShellEvent) => void) {
@@ -276,20 +268,23 @@ function requestId() {
 function PlayerSettings() {
   const settingsQuery = useSettings()
   const { data: settings } = settingsQuery
-  const [draft, setDraft, updateDraft] = useSourceDraft(settings?.client.player)
+  const [draft, setDraft, updateDraft, acceptSaved] = useSourceDraft(settings?.client.player)
   const [install, setInstall] = useState<{ state: string; message?: string; downloaded?: number; total?: number | null }>({ state: "idle" })
   const pendingPickers = useRef<Partial<Record<"mpv" | "mpchc", string>>>({})
   const pendingInstall = useRef<string | null>(null)
   const [picking, setPicking] = useState<Partial<Record<"mpv" | "mpchc", boolean>>>({})
   const mutation = useMutation({
-    mutationFn: api.settingsPatch.player,
-    onSuccess: (saved, submitted) => saveSettings(
-      saved,
-      submitted.playerBackend !== settings?.client.player.playerBackend &&
-        (submitted.playerBackend === "libmpv" || settings?.client.player.playerBackend === "libmpv")
-        ? "Player saved. Restart MediaFlick to apply the built-in player configuration."
-        : "Player settings saved",
-    ),
+    mutationFn: (value: ClientSettings["client"]["player"]) => api.settingsPatch.player(playerSettingsWrite(value)),
+    onSuccess: (saved, submitted) => {
+      acceptSaved(saved.client.player, submitted)
+      saveSettings(
+        saved,
+        submitted.playerBackend !== settings?.client.player.playerBackend &&
+          (submitted.playerBackend === "libmpv" || settings?.client.player.playerBackend === "libmpv")
+          ? "Player saved. Restart MediaFlick to apply the built-in player configuration."
+          : "Player settings saved",
+      )
+    },
     onError: (error: Error) => toast.error(error.message),
   })
   const onShellEvent = useCallback((event: ShellEvent) => {
@@ -399,7 +394,7 @@ function PlayerSettings() {
     : install.state === "failed" ? install.message : undefined
   return (
     <div className="settings-page">
-      <PageTitle title="Player" detail="Use MediaFlick's built-in player or hand playback to an external app." />
+      <PageTitle title="Player" />
       <Section title="Playback backend" description="The built-in libmpv player works without a separate mpv installation.">
         <SettingsRow title="Player" description="External mpv keeps its own config, scripts, shaders, and SVP setup.">
           <SelectField label="Player backend" value={draft.playerBackend} onValueChange={(playerBackend) => setDraft({ ...draft, playerBackend })} options={[{ value: "libmpv", label: "Built-in player", disabled: !settings.capabilities.libmpv }, { value: "mpv", label: "External mpv" }, { value: "mpchc", label: "MPC-HC", disabled: !settings.capabilities.mpchc }]} />
@@ -407,23 +402,23 @@ function PlayerSettings() {
         <SettingsRow title="Start fullscreen" description="Use a full-screen player window by default.">
           <SelectField label="Default fullscreen" value={draft.defaultFullscreen} onValueChange={(defaultFullscreen) => setDraft({ ...draft, defaultFullscreen })} options={[{ value: "fullscreen", label: "Fullscreen" }, { value: "windowed", label: "Windowed" }]} />
         </SettingsRow>
-        {draft.playerBackend !== "mpchc" && <SettingsRow title="Mark watched key" description="The mpv key that marks the current title watched and plays the next item. Leave blank to disable it.">
-          <Input className="w-52" value={draft.markWatchedNext ?? ""} onChange={(event) => setDraft({ ...draft, markWatchedNext: event.target.value || null })} placeholder="w" />
+        {draft.playerBackend !== "mpchc" && <SettingsRow controlId="mark-watched-key" title="Mark watched key" description="The mpv key that marks the current title watched and plays the next item. Leave blank to disable it.">
+          <Input id="mark-watched-key" aria-describedby="mark-watched-key-help" className="w-52" value={draft.markWatchedNext ?? ""} onChange={(event) => setDraft({ ...draft, markWatchedNext: event.target.value || null })} placeholder="w" />
         </SettingsRow>}
       </Section>
       {draft.playerBackend !== "libmpv" && <Section title="Executables" description="Paths are saved locally and are never sent to your Jellyfin server.">
-        {draft.playerBackend === "mpv" && <SettingsRow title="mpv executable" description="Select mpv.exe or use the installer on supported Windows builds.">
-          <div className="flex w-full max-w-md gap-2"><Input value={draft.mpvPath ?? ""} onChange={(event) => setDraft({ ...draft, mpvPath: event.target.value || null })} placeholder="Path to mpv" /><Button variant="outline" size="icon" aria-label="Choose mpv executable" aria-busy={picking.mpv} disabled={picking.mpv} onClick={() => pick("mpv")}><FolderOpen /></Button></div>
+        {draft.playerBackend === "mpv" && <SettingsRow controlId="mpv-path" title="mpv executable" description="Select mpv.exe or use the installer on supported Windows builds.">
+          <div className="flex w-full max-w-md gap-2"><Input id="mpv-path" aria-describedby="mpv-path-help" value={draft.mpvPath ?? ""} onChange={(event) => setDraft({ ...draft, mpvPath: event.target.value || null })} placeholder="Path to mpv" /><Button variant="outline" size="icon" aria-label="Choose mpv executable" aria-busy={picking.mpv} disabled={picking.mpv} onClick={() => pick("mpv")}><FolderOpen /></Button></div>
         </SettingsRow>}
         {draft.playerBackend === "mpv" && settings.capabilities.mpvInstaller && <SettingsRow title="Install mpv" description={installDetail ?? "Download and install the supported mpv build beside MediaFlick."}>
           <div className="flex gap-2"><Button variant="outline" onClick={installMpv} disabled={["queued", "downloading", "extracting"].includes(install.state)}><Download /> {install.state === "idle" || install.state === "failed" ? "Install mpv" : "Installing…"}</Button><Button variant="ghost" onClick={() => void api.shell.mpvHelp().catch((error: Error) => toast.error(error.message))}>Installation help</Button></div>
         </SettingsRow>}
         {draft.playerBackend === "mpv" && !settings.capabilities.mpvInstaller && <SettingsRow title="Install mpv" description="See mpv’s installation guide for your operating system."><Button variant="ghost" onClick={() => void api.shell.mpvHelp().catch((error: Error) => toast.error(error.message))}>Installation help</Button></SettingsRow>}
-        {draft.playerBackend === "mpchc" && settings.capabilities.mpchc && <SettingsRow title="MPC-HC executable" description="Select the MPC-HC executable used for playback.">
-          <div className="flex w-full max-w-md gap-2"><Input value={draft.mpchcPath ?? ""} onChange={(event) => setDraft({ ...draft, mpchcPath: event.target.value || null })} placeholder="Path to MPC-HC" /><Button variant="outline" size="icon" aria-label="Choose MPC-HC executable" aria-busy={picking.mpchc} disabled={picking.mpchc} onClick={() => pick("mpchc")}><FolderOpen /></Button></div>
+        {draft.playerBackend === "mpchc" && settings.capabilities.mpchc && <SettingsRow controlId="mpchc-path" title="MPC-HC executable" description="Select the MPC-HC executable used for playback.">
+          <div className="flex w-full max-w-md gap-2"><Input id="mpchc-path" aria-describedby="mpchc-path-help" value={draft.mpchcPath ?? ""} onChange={(event) => setDraft({ ...draft, mpchcPath: event.target.value || null })} placeholder="Path to MPC-HC" /><Button variant="outline" size="icon" aria-label="Choose MPC-HC executable" aria-busy={picking.mpchc} disabled={picking.mpchc} onClick={() => pick("mpchc")}><FolderOpen /></Button></div>
         </SettingsRow>}
       </Section>}
-      <SaveBar dirty={dirty} saving={mutation.isPending} onSave={() => mutation.mutate(playerSettingsWrite(draft))} onDiscard={() => setDraft(settings.client.player)} onReset={() => setDraft({ ...settings.client.player, playerBackend: settings.capabilities.libmpv ? "libmpv" : "mpv", mpvPath: null, mpchcPath: null, defaultFullscreen: "fullscreen", markWatchedNext: "w" })} restartMessage={restartMessage} />
+      <SaveBar dirty={dirty} saving={mutation.isPending} onSave={() => mutation.mutate(draft)} onDiscard={() => setDraft(settings.client.player)} onReset={() => setDraft({ ...settings.client.player, playerBackend: settings.capabilities.libmpv ? "libmpv" : "mpv", mpvPath: null, mpchcPath: null, defaultFullscreen: "fullscreen", markWatchedNext: "w" })} restartMessage={restartMessage} />
     </div>
   )
 }
@@ -431,13 +426,13 @@ function PlayerSettings() {
 function PlaybackSettings() {
   const settingsQuery = useSettings()
   const { data: settings } = settingsQuery
-  const [draft, setDraft] = useSourceDraft(settings?.client.playback)
-  const mutation = useMutation({ mutationFn: (value: ClientSettings["client"]["playback"]) => api.settingsPatch.playback(value), onSuccess: (saved) => saveSettings(saved), onError: (error: Error) => toast.error(error.message) })
+  const [draft, setDraft, , acceptSaved] = useSourceDraft(settings?.client.playback)
+  const mutation = useMutation({ mutationFn: (value: ClientSettings["client"]["playback"]) => api.settingsPatch.playback(value), onSuccess: (saved, submitted) => { acceptSaved(saved.client.playback, submitted); saveSettings(saved) }, onError: (error: Error) => toast.error(error.message) })
   if (settingsQuery.error && !settings) return <SettingsError title="Playback settings unavailable" error={settingsQuery.error} onRetry={() => void settingsQuery.refetch()} />
   if (!settings || !draft) return <SettingsLoading />
   const update = <Key extends keyof typeof draft>(key: Key, value: (typeof draft)[Key]) => setDraft({ ...draft, [key]: value })
   const choices = [{ value: "disabled", label: "Never" }, { value: "prompt", label: "Ask me" }, { value: "always", label: "Always skip" }] as const
-  return <div className="settings-page"><PageTitle title="Playback" detail="Set your default stream quality and handling for detected media segments." />
+  return <div className="settings-page"><PageTitle title="Playback" />
     <Section title="Streaming quality" description="Original sends the source unchanged; lower quality permits transcoding when needed.">
       <SettingsRow title="Default quality" description="You can still override this for an individual play."><SelectField label="Default streaming quality" value={draft.streamingQuality} onValueChange={(value) => update("streamingQuality", value)} options={[{ value: "original", label: "Original" }, { value: "auto", label: "Auto" }, { value: "120_mbps", label: "120 Mbps" }, { value: "80_mbps", label: "80 Mbps" }, { value: "60_mbps", label: "60 Mbps" }, { value: "40_mbps", label: "40 Mbps" }, { value: "20_mbps", label: "20 Mbps" }, { value: "10_mbps", label: "10 Mbps" }, { value: "5_mbps", label: "5 Mbps" }, { value: "3_mbps", label: "3 Mbps" }, { value: "1_5_mbps", label: "1.5 Mbps" }]} /></SettingsRow>
     </Section>
@@ -447,7 +442,16 @@ function PlaybackSettings() {
       <SettingsRow title="Recaps" description="Choose what happens when a recap marker is reached."><SelectField label="Recap skipping" value={draft.skipRecap} onValueChange={(value) => update("skipRecap", value)} options={choices} /></SettingsRow>
       <SettingsRow title="Commercials" description="Choose what happens when a commercial marker is reached."><SelectField label="Commercial skipping" value={draft.skipCommercial} onValueChange={(value) => update("skipCommercial", value)} options={choices} /></SettingsRow>
     </Section>
-    <SaveBar dirty={!same(draft, settings.client.playback)} saving={mutation.isPending} onSave={() => mutation.mutate(draft)} onDiscard={() => setDraft(settings.client.playback)} onReset={() => setDraft({ streamingQuality: "original", skipIntro: "prompt", skipCredits: "prompt", skipRecap: "prompt", skipCommercial: "prompt" })} />
+    {settings.client.player.playerBackend === "libmpv" && <Section title="Built-in player comfort" description="Subtitle changes apply to the next playback. Styled bitmap subtitles may keep their own appearance.">
+      <SubtitlePreview comfort={draft.comfort ?? DEFAULT_COMFORT} />
+      {([
+        ["subtitleSize", "Subtitle size (%)", 50, 200], ["subtitleOutline", "Subtitle outline", 0, 8],
+        ["subtitleBackground", "Subtitle background (%)", 0, 100], ["subtitlePosition", "Subtitle vertical position", 0, 100],
+        ["seekBackSeconds", "Seek backward seconds", 1, 120], ["seekForwardSeconds", "Seek forward seconds", 1, 120],
+      ] as const).map(([key, label, min, max]) => <SettingsRow key={key} title={label}><Input aria-label={label} type="number" min={min} max={max} value={(draft.comfort ?? DEFAULT_COMFORT)[key]} onChange={(event) => setDraft({...draft, comfort:{...(draft.comfort ?? DEFAULT_COMFORT), [key]:Number(event.target.value)}})} /></SettingsRow>)}
+      {([ ["pauseKey", "Pause key"], ["muteKey", "Mute key"], ["fullscreenKey", "Fullscreen key"] ] as const).map(([key, label]) => <SettingsRow key={key} title={label} description="One unique letter, except J/L/Q/V and the mark-watched key. Space pauses; arrows and J/L seek."><Input aria-label={label} maxLength={1} value={(draft.comfort ?? DEFAULT_COMFORT)[key]} onChange={(event) => setDraft({...draft, comfort:{...(draft.comfort ?? DEFAULT_COMFORT), [key]:event.target.value.toLowerCase()}})} /></SettingsRow>)}
+    </Section>}
+    <SaveBar dirty={!same(draft, settings.client.playback)} saving={mutation.isPending} onSave={() => mutation.mutate(draft)} onDiscard={() => setDraft(settings.client.playback)} onReset={() => setDraft({ comfort: {...DEFAULT_COMFORT}, streamingQuality: "original", skipIntro: "prompt", skipCredits: "prompt", skipRecap: "prompt", skipCommercial: "prompt" })} />
   </div>
 }
 
@@ -455,9 +459,9 @@ function ApplicationSettings() {
   const settingsQuery = useSettings()
   const { data: settings } = settingsQuery
   const { data: status } = useStatus()
-  const [draft, setDraft] = useSourceDraft(settings?.client.application)
+  const [draft, setDraft, , acceptSaved] = useSourceDraft(settings?.client.application)
   const [deleteConfirmation, setDeleteConfirmation] = useState("")
-  const mutation = useMutation({ mutationFn: (value: ClientSettings["client"]["application"]) => api.settingsPatch.application(value), onSuccess: (saved) => saveSettings(saved), onError: (error: Error) => toast.error(error.message) })
+  const mutation = useMutation({ mutationFn: (value: ClientSettings["client"]["application"]) => api.settingsPatch.application(value), onSuccess: (saved, submitted) => { acceptSaved(saved.client.application, submitted); saveSettings(saved) }, onError: (error: Error) => toast.error(error.message) })
   const deleteAccount = useMutation({
     mutationFn: api.collections.deleteLocalAccount,
     onSuccess: (anonymousStatus) => {
@@ -470,7 +474,7 @@ function ApplicationSettings() {
   })
   if (settingsQuery.error && !settings) return <SettingsError title="Application settings unavailable" error={settingsQuery.error} onRetry={() => void settingsQuery.refetch()} />
   if (!settings || !draft) return <SettingsLoading />
-  return <div className="settings-page"><PageTitle title="Application" detail="Control window behavior and the diagnostics recorded by the desktop client." />
+  return <div className="settings-page"><PageTitle title="Application" />
     {(settings.recoveries?.length ?? 0) > 0 && <Section title="Recovered local settings" description="MediaFlick preserved each damaged file before continuing.">
       {settings.recoveries?.map((recovery) => <p key={recovery.area} className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100" role="status">
         {recovery.area}: {recovery.restoredBackup ? "the last valid backup was restored." : "defaults are in use because no valid backup was available."}
@@ -538,7 +542,7 @@ const PREVIEW_DEPENDENCIES: PreviewDependencies = {
  */
 const PANEL_HOST = document.createElement("div")
 
-function AppearancePreview({ appearance }: { appearance: AppearanceSettings }) {
+function AppearancePreview({ appearance, previewDelay }: { appearance: AppearanceSettings; previewDelay?: number }) {
   const systemReducedMotion = usePrefersReducedMotion()
   const reducedMotion = systemReducedMotion || appearance.reducedMotion
   const home = useHome()
@@ -586,8 +590,8 @@ function AppearancePreview({ appearance }: { appearance: AppearanceSettings }) {
     "--artwork-intensity": String(appearance.artworkIntensity / 100),
     "--backdrop-intensity": String(appearance.backdropIntensity / 100),
   }
-  const resume = home.data?.rows.find((row) => row.id === "resume")?.items[0]
-  const recent = home.data?.rows.find((row) => row.id === "recent")?.items.slice(0, 4) ?? []
+  const resume = home.data?.continueWatching[0]
+  const recent = home.data?.rows.find((row) => row.id === "recentlyAdded")?.items.slice(0, 4) ?? []
 
   return (
     <figure
@@ -611,6 +615,7 @@ function AppearancePreview({ appearance }: { appearance: AppearanceSettings }) {
       </figcaption>
       <PreviewProvider
         enabled={appearance.cardPreviews}
+        delay={previewDelay}
         container={PANEL_HOST}
         dependencies={PREVIEW_DEPENDENCIES}
       >
@@ -676,19 +681,46 @@ export function Appearance() {
   const statusQuery = useStatus()
   const { data: status } = statusQuery
   const settingsQuery = useSettings()
+  const viewing = useViewing()
+  const cache = useQueryClient()
+  const account = collectionAccountKey(status)
+  const [previewDelay, setPreviewDelay, , acceptDelay] = useSourceDraft(viewing.data?.previewDelayMs, account)
   const ratingsQuery = useRatingsStatus(Boolean(status?.authenticated))
   const { data: settings } = settingsQuery
   const { data: ratings } = ratingsQuery
-  const [draft, setDraft] = useSourceDraft(settings?.appearance)
-  const mutation = useMutation({ mutationFn: (value: AppearanceSettings) => api.settingsPatch.appearance(value), onSuccess: (saved) => saveSettings(saved), onError: (error: Error) => toast.error(error.message) })
+  const [draft, setDraft, , acceptSaved] = useSourceDraft(settings?.appearance, collectionAccountKey(status))
+  const mutation = useMutation({
+    mutationFn: async (submitted: { appearance: AppearanceSettings; previewDelay: number | undefined }) => {
+      const checkAccount = () => {
+        if (collectionAccountKey(cache.getQueryData<Status>(queryKeys.status)) !== account) throw new Error("The signed-in account changed. Save these settings again.")
+      }
+      checkAccount()
+      if (!same(submitted.appearance, settings?.appearance)) {
+        const saved = await api.settingsPatch.appearance(submitted.appearance)
+        checkAccount()
+        cache.setQueryData(queryKeys.settings, saved)
+        acceptSaved(saved.appearance, submitted.appearance)
+      }
+      if (submitted.previewDelay !== undefined && submitted.previewDelay !== viewing.data?.previewDelayMs) {
+        const current = await api.viewing()
+        checkAccount()
+        const saved = await api.saveViewing({ ...current, previewDelayMs: submitted.previewDelay })
+        checkAccount()
+        cache.setQueryData(["viewing", account], saved)
+        acceptDelay(saved.previewDelayMs, submitted.previewDelay)
+      }
+    },
+    onSuccess: () => toast.success("Appearance settings saved"),
+    onError: (error: Error) => toast.error(error.message),
+  })
   if (statusQuery.error && !status) return <SettingsError title="Appearance unavailable" error={statusQuery.error} onRetry={() => void statusQuery.refetch()} />
   if (statusQuery.isPending) return <SettingsLoading />
   if (!status?.authenticated) return <SignInRequired name="Appearance" />
   if (settingsQuery.error && !settings) return <SettingsError title="Appearance settings unavailable" error={settingsQuery.error} onRetry={() => void settingsQuery.refetch()} />
   if (!settings || !draft) return <SettingsLoading />
-  return <div className="settings-page"><PageTitle title="Appearance" detail="Tune MediaFlick for this Jellyfin account without changing library or server settings." />
+  return <div className="settings-page"><PageTitle title="Appearance" />
     <Section title="Live preview" description="Your own shelves with your unsaved choices applied here only; the rest of MediaFlick changes after Save.">
-      <AppearancePreview appearance={draft} />
+      <AppearancePreview appearance={draft} previewDelay={previewDelay} />
     </Section>
     <Section title="Theme" description="System follows the current operating-system color preference.">
       <SettingsRow title="Color mode" description="Choose the overall surface treatment."><SelectField label="Color mode" value={draft.theme} onValueChange={(theme) => setDraft({ ...draft, theme })} options={[{ value: "system", label: "System" }, { value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} /></SettingsRow>
@@ -698,6 +730,10 @@ export function Appearance() {
     <Section title="Cards" description="Choose how library cards behave and what they show.">
       <SettingsRow title="Card previews" description="Open a larger panel after resting the pointer on a card. When off, Play, My List, and watched buttons stay on the card.">
         <Switch aria-label="Show pop-out previews on cards" checked={draft.cardPreviews} onCheckedChange={(cardPreviews) => setDraft({ ...draft, cardPreviews })} />
+      </SettingsRow>
+      <SettingsRow controlId="card-preview-delay" title="Card preview delay" description="Milliseconds before a card preview opens.">
+        <Input id="card-preview-delay" aria-label="Card preview delay" type="number" min={200} max={2000} step={50} disabled={!draft.cardPreviews || previewDelay === undefined} value={previewDelay ?? ""} onChange={(event) => setPreviewDelay(Number(event.target.value))} />
+        {viewing.error && <Button variant="ghost" onClick={() => void viewing.refetch()}>Retry loading delay</Button>}
       </SettingsRow>
       <SettingsRow title="Media info" description="Show video resolution, dynamic range, and audio format on library cards.">
         <Switch aria-label="Show media info on cards" checked={draft.showMediaInfo} onCheckedChange={(showMediaInfo) => setDraft({ ...draft, showMediaInfo })} />
@@ -721,40 +757,401 @@ export function Appearance() {
       </div>
     </Section>
     <Section title="Artwork and motion" description="Lower artwork intensity for a quieter browsing surface.">
-      <SettingsRow title="Artwork intensity" description={`${draft.artworkIntensity}%`}><Slider aria-label="Artwork intensity" className="w-52" value={[draft.artworkIntensity]} onValueChange={([artworkIntensity]) => setDraft({ ...draft, artworkIntensity })} /></SettingsRow>
-      <SettingsRow title="Backdrop intensity" description={`${draft.backdropIntensity}%`}><Slider aria-label="Backdrop intensity" className="w-52" value={[draft.backdropIntensity]} onValueChange={([backdropIntensity]) => setDraft({ ...draft, backdropIntensity })} /></SettingsRow>
+      <SettingsRow controlId="artwork-intensity" title="Artwork intensity" description={`${draft.artworkIntensity}%`}><Slider id="artwork-intensity" aria-label="Artwork intensity" aria-describedby="artwork-intensity-help" aria-valuetext={`${draft.artworkIntensity} percent`} className="w-52" value={[draft.artworkIntensity]} onValueChange={([artworkIntensity]) => setDraft({ ...draft, artworkIntensity })} /></SettingsRow>
+      <SettingsRow controlId="backdrop-intensity" title="Backdrop intensity" description={`${draft.backdropIntensity}%`}><Slider id="backdrop-intensity" aria-label="Backdrop intensity" aria-describedby="backdrop-intensity-help" aria-valuetext={`${draft.backdropIntensity} percent`} className="w-52" value={[draft.backdropIntensity]} onValueChange={([backdropIntensity]) => setDraft({ ...draft, backdropIntensity })} /></SettingsRow>
       <SettingsRow title="Reduce motion" description="Disable decorative transitions and automatic movement."><Switch aria-label="Reduce motion" checked={draft.reducedMotion} onCheckedChange={(reducedMotion) => setDraft({ ...draft, reducedMotion })} /></SettingsRow>
     </Section>
-    <SaveBar dirty={!same(draft, settings.appearance)} saving={mutation.isPending} onSave={() => mutation.mutate(draft)} onDiscard={() => setDraft(settings.appearance)} onReset={() => setDraft({ theme: "system", accent: "signal", density: "comfortable", artworkIntensity: 100, backdropIntensity: 100, reducedMotion: false, cardPreviews: true, showMediaInfo: true, ratingSources: [] })} />
+    <SaveBar dirty={!same(draft, settings.appearance) || previewDelay !== viewing.data?.previewDelayMs} saving={mutation.isPending} onSave={() => mutation.mutate({ appearance: draft, previewDelay })} onDiscard={() => { setDraft(settings.appearance); setPreviewDelay(viewing.data?.previewDelayMs) }} onReset={() => { if (previewDelay !== undefined) setPreviewDelay(DEFAULT_VIEWING.previewDelayMs); setDraft({ theme: "system", accent: "signal", density: "comfortable", artworkIntensity: 100, backdropIntensity: 100, reducedMotion: false, cardPreviews: true, showMediaInfo: true, ratingSources: [] }) }} />
+  </div>
+}
+
+type HomeElement = HomeConfiguration["elements"][number]
+
+type HomeDrag = {
+  key: string
+  pointerId: number
+  x: number
+  y: number
+  offsetX: number
+  offsetY: number
+  width: number
+  height: number
+  dropIndex: number
+}
+
+const homeElementKey = (element: HomeElement) => `${element.kind}:${element.id}`
+
+function dropHomeElement(configuration: HomeConfiguration, key: string, dropIndex: number) {
+  const visible = configuration.elements.filter((element) => element.available)
+  const from = visible.findIndex((element) => homeElementKey(element) === key)
+  if (from < 0) return configuration
+  const [dragged] = visible.splice(from, 1)
+  visible.splice(Math.max(0, Math.min(dropIndex, visible.length)), 0, dragged)
+  let visibleIndex = 0
+  return {
+    ...configuration,
+    elements: configuration.elements.map((element) => element.available ? visible[visibleIndex++] : element),
+  }
+}
+
+function HomeSettingsPage() {
+  const status = useStatus()
+  const query = useHomeSettings(Boolean(status.data?.authenticated))
+  const [draft, setDraft, updateDraft, acceptSaved] = useSourceDraft(query.data?.settings, collectionAccountKey(status.data))
+  const [dragging, setDragging] = useState<HomeDrag | null>(null)
+  const dragRef = useRef<HomeDrag | null>(null)
+  const visible = useMemo(() => draft?.elements.filter((element) => element.available) ?? [], [draft])
+  useEffect(() => {
+    if (!dragging?.key) return
+    const movePointer = (event: PointerEvent) => {
+      const current = dragRef.current
+      if (!current || event.pointerId !== current.pointerId) return
+      const remainingKeys = visible
+        .map(homeElementKey)
+        .filter((key) => key !== current.key)
+      let dropIndex = remainingKeys.length
+      for (const row of document.querySelectorAll<HTMLElement>("[data-home-element-key]")) {
+        const index = remainingKeys.indexOf(row.dataset.homeElementKey ?? "")
+        if (index < 0) continue
+        const bounds = row.getBoundingClientRect()
+        if (event.clientY < bounds.top + bounds.height / 2) {
+          dropIndex = index
+          break
+        }
+      }
+      const next = { ...current, x: event.clientX, y: event.clientY, dropIndex }
+      dragRef.current = next
+      setDragging(next)
+    }
+    const dropPointer = (event: PointerEvent) => {
+      const current = dragRef.current
+      if (!current || event.pointerId !== current.pointerId) return
+      updateDraft((configuration) => configuration ? dropHomeElement(configuration, current.key, current.dropIndex) : configuration)
+      dragRef.current = null
+      setDragging(null)
+    }
+    const cancelDrag = () => {
+      dragRef.current = null
+      setDragging(null)
+    }
+    const cancelWithEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") cancelDrag()
+    }
+    window.addEventListener("pointermove", movePointer)
+    window.addEventListener("pointerup", dropPointer)
+    window.addEventListener("pointercancel", cancelDrag)
+    window.addEventListener("keydown", cancelWithEscape)
+    window.addEventListener("blur", cancelDrag)
+    return () => {
+      window.removeEventListener("pointermove", movePointer)
+      window.removeEventListener("pointerup", dropPointer)
+      window.removeEventListener("pointercancel", cancelDrag)
+      window.removeEventListener("keydown", cancelWithEscape)
+      window.removeEventListener("blur", cancelDrag)
+    }
+  }, [dragging?.key, updateDraft, visible])
+  const mutation = useMutation({
+    mutationFn: (value: HomeConfiguration) => api.saveHomeSettings(homeSettingsWrite(value)),
+    onSuccess: (saved, submitted) => {
+      acceptSaved(saved.settings, submitted)
+      queryClient.setQueryData(queryKeys.homeSettings, saved)
+      void queryClient.invalidateQueries({ queryKey: queryKeys.home })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.homeResume })
+      queryClient.removeQueries({ queryKey: queryKeys.billboard })
+      toast.success("Home settings saved")
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  if (status.isPending) return <SettingsLoading />
+  if (!status.data?.authenticated) return <SignInRequired name="Home" />
+  if (query.error && !query.data) return <SettingsError title="Home settings unavailable" error={query.error} onRetry={() => void query.refetch()} />
+  if (!query.data || !draft) return <SettingsLoading />
+
+  const move = (fromKey: string, toKey: string) => {
+    if (fromKey === toKey) return
+    updateDraft((current) => {
+      if (!current) return current
+      const from = current.elements.findIndex((element) => homeElementKey(element) === fromKey)
+      const to = current.elements.findIndex((element) => homeElementKey(element) === toKey)
+      if (from < 0 || to < 0) return current
+      const elements = [...current.elements]
+      const [element] = elements.splice(from, 1)
+      elements.splice(to, 0, element)
+      return { ...current, elements }
+    })
+  }
+  const moveVisible = (index: number, offset: number) => {
+    const target = visible[index + offset]
+    if (target) move(homeElementKey(visible[index]), homeElementKey(target))
+  }
+  const setElementEnabled = (key: string, enabled: boolean) => updateDraft((current) => current ? ({
+    ...current,
+    elements: current.elements.map((element) => homeElementKey(element) === key ? { ...element, enabled } : element),
+  }) : current)
+  const draggedElement = dragging ? visible.find((element) => homeElementKey(element) === dragging.key) : null
+  const remaining = dragging ? visible.filter((element) => homeElementKey(element) !== dragging.key) : visible
+  const slots = remaining.length + (dragging ? 1 : 0)
+
+  return <div className="settings-page">
+    <PageTitle title="Home" />
+    <Section title="Billboard" description="The billboard stays fixed above every shelf.">
+      <SettingsRow title="Show billboard" description="Rotate a small selection of titles with landscape artwork.">
+        <Checkbox checked={draft.billboard} onCheckedChange={(checked) => setDraft({ ...draft, billboard: checked === true })} aria-label="Show billboard" />
+      </SettingsRow>
+    </Section>
+    <Section title="Shelves" description="Disabled shelves keep their positions. Drag a handle or use the arrow buttons to reorder.">
+      <div className="space-y-2">
+        {Array.from({ length: slots }, (_, slot) => {
+          if (dragging && slot === dragging.dropIndex) return <div
+            key="home-drop-placeholder"
+            data-testid="home-drop-placeholder"
+            aria-hidden
+            className="rounded-lg border-2 border-dashed border-primary/60 bg-primary/10 shadow-inner"
+            style={{ height: dragging.height }}
+          />
+          const index = dragging && slot > dragging.dropIndex ? slot - 1 : slot
+          const element = remaining[index]
+          if (!element) return null
+          const key = homeElementKey(element)
+          const visibleIndex = visible.findIndex((candidate) => homeElementKey(candidate) === key)
+          const watching = element.kind === "builtIn" && element.id === "watching"
+          return <div
+            key={key}
+            data-home-element-key={key}
+            className="rounded-lg border bg-card p-3"
+          >
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                aria-label={`Drag ${element.label}`}
+                className="shrink-0 touch-none select-none cursor-grab text-muted-foreground active:cursor-grabbing"
+                onPointerDown={(event) => {
+                  if (event.button !== 0) return
+                  const row = event.currentTarget.closest<HTMLElement>("[data-home-element-key]")
+                  if (!row) return
+                  event.preventDefault()
+                  const bounds = row.getBoundingClientRect()
+                  const next = {
+                    key,
+                    pointerId: event.pointerId,
+                    x: event.clientX,
+                    y: event.clientY,
+                    offsetX: event.clientX - bounds.left,
+                    offsetY: event.clientY - bounds.top,
+                    width: bounds.width,
+                    height: bounds.height,
+                    dropIndex: visibleIndex,
+                  }
+                  dragRef.current = next
+                  setDragging(next)
+                }}
+              ><GripVertical className="size-4" aria-hidden /></button>
+              <Checkbox checked={element.enabled} onCheckedChange={(checked) => setElementEnabled(key, checked === true)} aria-label={`Show ${element.label}`} />
+              <div className="min-w-0 flex-1"><div className="truncate font-medium">{element.label}</div><div className="text-xs text-muted-foreground">{element.category}</div></div>
+              <Button type="button" size="icon-sm" variant="ghost" disabled={visibleIndex === 0} aria-label={`Move ${element.label} up`} onClick={() => moveVisible(visibleIndex, -1)}><ArrowUp /></Button>
+              <Button type="button" size="icon-sm" variant="ghost" disabled={visibleIndex === visible.length - 1} aria-label={`Move ${element.label} down`} onClick={() => moveVisible(visibleIndex, 1)}><ArrowDown /></Button>
+            </div>
+            {watching && <div className="mt-3 ml-7 grid gap-3 border-t pt-3 sm:grid-cols-3">
+              <label className="flex items-center gap-2 text-sm"><Checkbox checked={draft.watching.continueWatching} onCheckedChange={(checked) => setDraft({ ...draft, watching: { ...draft.watching, continueWatching: checked === true } })} />Continue Watching</label>
+              <label className="flex items-center gap-2 text-sm"><Checkbox checked={draft.watching.nextUp} onCheckedChange={(checked) => setDraft({ ...draft, watching: { ...draft.watching, nextUp: checked === true } })} />Next Up</label>
+              <label className="flex items-center gap-2 text-sm"><Checkbox checked={draft.watching.combine} onCheckedChange={(checked) => setDraft({ ...draft, watching: { ...draft.watching, combine: checked === true } })} />Combine shelves</label>
+            </div>}
+          </div>
+        })}
+      </div>
+      {query.data.collectionMode === "jellyfin" && <p className="text-xs text-muted-foreground">My Collection shelves are hidden while Jellyfin collection mode is active.</p>}
+    </Section>
+    <SaveBar dirty={!same(draft, query.data.settings)} saving={mutation.isPending} onSave={() => mutation.mutate(draft)} onDiscard={() => setDraft(query.data.settings)} onReset={() => setDraft(query.data.defaults)} />
+    {dragging && draggedElement && createPortal(<div
+      aria-hidden
+      data-testid="home-drag-preview"
+      className="pointer-events-none fixed z-[100] rotate-[0.35deg] scale-[1.015] rounded-lg border border-primary/50 bg-card/95 p-3 opacity-95 shadow-2xl ring-1 ring-primary/30"
+      style={{
+        left: dragging.x - dragging.offsetX,
+        top: dragging.y - dragging.offsetY,
+        width: dragging.width,
+        minHeight: dragging.height,
+      }}
+    >
+      <div className="flex items-center gap-3">
+        <GripVertical className="size-4 shrink-0 text-primary" />
+        <Checkbox checked={draggedElement.enabled} disabled tabIndex={-1} />
+        <div className="min-w-0 flex-1"><div className="truncate font-medium">{draggedElement.label}</div><div className="text-xs text-muted-foreground">{draggedElement.category}</div></div>
+      </div>
+      {draggedElement.kind === "builtIn" && draggedElement.id === "watching" && <div className="mt-3 ml-7 border-t pt-3 text-sm text-muted-foreground">Continue Watching · Next Up · Combine shelves</div>}
+    </div>, document.body)}
+  </div>
+}
+
+function ViewingPreferences() {
+  const query = useViewing()
+  const { data: status } = useStatus()
+  const account = collectionAccountKey(status)
+  const [draft, setDraft, , acceptSaved] = useSourceDraft(query.data, account)
+  const [audioText, setAudioText, , acceptAudio] = useSourceDraft(query.data?.audioLanguages.join(", "), account)
+  const [subtitleText, setSubtitleText, , acceptSubtitles] = useSourceDraft(query.data?.subtitleLanguages.join(", "), account)
+  const save = useMutation({
+    mutationFn: api.saveViewing,
+    onSuccess: (saved, submitted) => {
+      queryClient.setQueryData(["viewing", account], saved)
+      acceptSaved(saved, submitted)
+      acceptAudio(saved.audioLanguages.join(", "), submitted.audioLanguages.join(", "))
+      acceptSubtitles(saved.subtitleLanguages.join(", "), submitted.subtitleLanguages.join(", "))
+      toast.success("Viewing settings saved")
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  if (!status?.authenticated) return <SignInRequired name="Viewing" />
+  if (query.error && !draft) return <SettingsError error={query.error} onRetry={() => void query.refetch()} />
+  if (!draft) return <SettingsLoading />
+  const update = <K extends keyof ViewingSettings>(key: K, value: ViewingSettings[K]) => setDraft({ ...draft, [key]: value })
+  return <div className="settings-page">
+    <PageTitle title="Viewing" />
+    <Section title="Episodes">
+      <SettingsRow title="Spoiler protection" description="Hide unwatched episode titles, artwork, and summaries. Reveal them on the episode details page."><Switch aria-label="Spoiler protection" checked={draft.spoilerProtection} onCheckedChange={(value) => update("spoilerProtection", value)} /></SettingsRow>
+      <SettingsRow title="Next episode"><SelectField label="Next episode" value={draft.nextEpisode} onValueChange={(value) => update("nextEpisode", value)} options={[{value:"off",label:"Off"},{value:"ask",label:"Ask with countdown"},{value:"auto",label:"Automatically play"}]} /></SettingsRow>
+      <SettingsRow title="Countdown seconds"><Input aria-label="Countdown seconds" type="number" min={3} max={60} value={draft.countdownSeconds} onChange={(event) => update("countdownSeconds", Number(event.target.value))} /></SettingsRow>
+      <SettingsRow title="Episode limit" description="Stop continuous playback after this many episodes. Zero means unlimited; starting a title manually begins a new session."><Input aria-label="Episode limit" type="number" min={0} max={20} value={draft.episodeLimit} onChange={(event) => update("episodeLimit", Number(event.target.value))} /></SettingsRow>
+      <SettingsRow title="Resume rewind"><SelectField label="Resume rewind" value={String(draft.resumeRewindSeconds)} onValueChange={(value) => update("resumeRewindSeconds", Number(value))} options={[0,5,10,30].map((value) => ({value:String(value),label:`${value} seconds`}))} /></SettingsRow>
+    </Section>
+    <Section title="Languages" description="Use language codes in preference order, separated by commas (for example en, de, ja). Individual title choices take priority.">
+      <SettingsRow title="Audio languages"><Input aria-label="Audio languages" value={audioText ?? ""} onChange={(event) => setAudioText(event.target.value)} /></SettingsRow>
+      <SettingsRow title="Prefer original audio" description="Prefer a track explicitly labeled original when available."><Switch aria-label="Prefer original audio" checked={draft.preferOriginalAudio} onCheckedChange={(value) => update("preferOriginalAudio", value)} /></SettingsRow>
+      <SettingsRow title="Subtitle languages"><Input aria-label="Subtitle languages" value={subtitleText ?? ""} onChange={(event) => setSubtitleText(event.target.value)} /></SettingsRow>
+      <SettingsRow title="Subtitles"><SelectField label="Subtitles" value={draft.subtitleMode} onValueChange={(value) => update("subtitleMode", value)} options={[{value:"server",label:"Jellyfin default"},{value:"off",label:"Off"},{value:"forced",label:"Forced only"},{value:"always",label:"Always"},{value:"foreignAudio",label:"When audio differs from preferred languages"}]} /></SettingsRow>
+    </Section>
+    <Section title="Browsing">
+      <SettingsRow title="Text size"><Input aria-label="Text size percent" type="number" min={80} max={150} value={draft.textScale} onChange={(event) => update("textScale", Number(event.target.value))} /></SettingsRow>
+      <SettingsRow title="Poster width"><SelectField label="Poster width" value={String(draft.posterSize)} onValueChange={(value) => update("posterSize", Number(value))} options={[...([120,144,168,200,240].includes(draft.posterSize) ? [] : [{value:String(draft.posterSize),label:`Current — ${draft.posterSize} px`,disabled:true}]), {value:"120",label:"Small — 120 px"},{value:"144",label:"Medium — 144 px"},{value:"168",label:"Default — 168 px"},{value:"200",label:"Large — 200 px"},{value:"240",label:"Extra large — 240 px"}]} /></SettingsRow>
+      <SettingsRow title="Startup destination"><SelectField label="Startup destination" value={draft.startupDestination} onValueChange={(value) => update("startupDestination", value)} options={[{value:"home",label:"Home"},{value:"movies",label:"Movies"},{value:"series",label:"Series"},{value:"calendar",label:"Calendar"},{value:"last",label:"Last browsing page"}]} /></SettingsRow>
+      <SettingsRow title="Remember library filters" description="Keep separate sort and filters for Movies and Series."><Switch aria-label="Remember library filters" checked={draft.rememberFilters} onCheckedChange={(value) => update("rememberFilters", value)} /></SettingsRow>
+      <SettingsRow title="Hide watched by default"><Switch aria-label="Hide watched by default" checked={draft.hideWatched} onCheckedChange={(value) => update("hideWatched", value)} /></SettingsRow>
+    </Section>
+    <SaveBar dirty={!same(draft, query.data) || audioText !== query.data?.audioLanguages.join(", ") || subtitleText !== query.data?.subtitleLanguages.join(", ")} saving={save.isPending}
+      onSave={() => { const submitted = {...draft, audioLanguages:(audioText ?? "").split(",").map((value) => value.trim().toLowerCase()).filter(Boolean), subtitleLanguages:(subtitleText ?? "").split(",").map((value) => value.trim().toLowerCase()).filter(Boolean)}; setDraft(submitted); setAudioText(submitted.audioLanguages.join(", ")); setSubtitleText(submitted.subtitleLanguages.join(", ")); save.mutate(submitted) }}
+      onDiscard={() => { setDraft(query.data); setAudioText(query.data?.audioLanguages.join(", ")); setSubtitleText(query.data?.subtitleLanguages.join(", ")) }}
+      onReset={() => { setDraft({...DEFAULT_VIEWING, previewDelayMs:query.data?.previewDelayMs ?? DEFAULT_VIEWING.previewDelayMs}); setAudioText(""); setSubtitleText("") }} />
   </div>
 }
 
 function SignInRequired({ name }: { name: string }) {
-  return <div className="settings-page"><PageTitle title={name} detail="This configuration belongs to the signed-in Jellyfin account." /><Section title="Sign in required" description={`Sign in to your Jellyfin server to view or configure ${name}.`}><Button asChild><RouterLink to="/">Go to sign in</RouterLink></Button></Section></div>
+  return <div className="settings-page"><PageTitle title={name} /><Section title="Sign in required" description={`Sign in to your Jellyfin server to view or configure ${name}.`}><Button asChild><RouterLink to="/">Go to sign in</RouterLink></Button></Section></div>
 }
 
 function Letterboxd() {
+  const cache = useQueryClient()
   const statusQuery = useStatus()
   const { data: status } = statusQuery
   const profiles = useQuery({ queryKey: ["letterboxd", "profiles"], queryFn: api.letterboxd.profiles, enabled: Boolean(status?.authenticated), retry: false })
   const [entry, setEntry] = useState("")
+  const [additions, setAdditions] = useState<string[]>([])
+  const [removals, setRemovals] = useState<string[]>([])
+  const account = collectionAccountKey(status)
+  const savedEnabled = useMemo<Record<string, boolean> | null>(() => profiles.data ? Object.fromEntries(
+    profiles.data.profiles.map((profile) => [profile.id, profile.enabled]),
+  ) : null, [profiles.data])
+  const [enabledDraft, setEnabledDraft] = useSourceDraft(savedEnabled, account)
+  const isCurrentAccount = () => collectionAccountKey(cache.getQueryData<Status>(queryKeys.status)) === account
+  const checkAccount = () => {
+    if (!isCurrentAccount()) throw new Error("The signed-in account changed. Remaining profile changes were not saved.")
+  }
   // Profile writes also change every movie's public-review projection.
-  const refresh = () => void queryClient.invalidateQueries({ queryKey: ["letterboxd"] })
-  const add = useMutation({ mutationFn: api.letterboxd.add, onSuccess: () => { setEntry(""); refresh(); toast.success("Letterboxd profile added") }, onError: (error: Error) => toast.error(error.message) })
-  const setEnabled = useMutation({ mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.letterboxd.setEnabled(id, enabled), onSuccess: refresh, onError: (error: Error) => toast.error(error.message) })
-  const remove = useMutation({ mutationFn: api.letterboxd.remove, onSuccess: refresh, onError: (error: Error) => toast.error(error.message) })
+  const refresh = () => { if (isCurrentAccount()) void cache.invalidateQueries({ queryKey: ["letterboxd"] }) }
+  const rememberProfile = (profile: LetterboxdProfile) => {
+    checkAccount()
+    cache.setQueryData<Awaited<ReturnType<typeof api.letterboxd.profiles>>>(["letterboxd", "profiles"], (current) => {
+      const existing = current?.profiles ?? []
+      return { profiles: existing.some((candidate) => candidate.id === profile.id)
+        ? existing.map((candidate) => candidate.id === profile.id ? profile : candidate)
+        : [...existing, profile] }
+    })
+  }
+  const save = useMutation({
+    mutationFn: async (submitted: { enabled: Record<string, boolean>; additions: string[]; removals: string[] }) => {
+      // Acknowledge each completed write so a later failure leaves only unfinished work to retry.
+      for (const profile of profiles.data?.profiles ?? []) {
+        checkAccount()
+        const enabled = submitted.enabled[profile.id] ?? profile.enabled
+        if (enabled !== profile.enabled && !submitted.removals.includes(profile.id)) {
+          const saved = await api.letterboxd.setEnabled(profile.id, enabled)
+          rememberProfile(saved.profile)
+        }
+      }
+      for (const id of submitted.removals) {
+        checkAccount()
+        await api.letterboxd.remove(id)
+        checkAccount()
+        cache.setQueryData<Awaited<ReturnType<typeof api.letterboxd.profiles>>>(["letterboxd", "profiles"], (current) => ({
+          profiles: (current?.profiles ?? []).filter((profile) => profile.id !== id),
+        }))
+        setRemovals((current) => current.filter((removed) => removed !== id))
+      }
+      for (const input of submitted.additions) {
+        checkAccount()
+        const saved = await api.letterboxd.add(input)
+        rememberProfile(saved.profile)
+        setAdditions((current) => current.filter((added) => added !== input))
+      }
+    },
+    onSuccess: () => toast.success("Letterboxd settings saved"),
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: refresh,
+  })
   const verify = useMutation({ mutationFn: api.letterboxd.refresh, onSuccess: refresh, onError: (error: Error) => toast.error(error.message) })
   const open = useMutation({ mutationFn: api.letterboxd.open, onError: (error: Error) => toast.error(error.message) })
+  const queuedAdditions = () => [...new Set([...additions, ...(entry.trim() ? [entry.trim()] : [])])]
+  const clearPending = () => {
+    setEntry("")
+    setAdditions([])
+    setRemovals([])
+    save.reset()
+  }
   if (statusQuery.error && !status) return <SettingsError title="Letterboxd unavailable" error={statusQuery.error} onRetry={() => void statusQuery.refetch()} />
   if (statusQuery.isPending) return <SettingsLoading />
   if (!status?.authenticated) return <SignInRequired name="Letterboxd" />
-  return <div className="settings-page"><PageTitle title="Letterboxd" detail="Connect public profiles using Letterboxd’s public RSS feed—no credentials are stored." />
-    <Section title="Add profile" description="Enter a Letterboxd username or a canonical profile URL.">
-      <form className="flex max-w-xl gap-2" onSubmit={(event) => { event.preventDefault(); if (entry.trim()) add.mutate(entry) }}><Input value={entry} onChange={(event) => setEntry(event.target.value)} placeholder="letterboxd username or URL" /><Button disabled={add.isPending}>{add.isPending ? "Verifying…" : "Add profile"}</Button></form>
-    </Section>
-    <Section title="Connected profiles" description="Profiles are visible only to this Jellyfin account on this server.">
-      {profiles.isPending ? <p className="text-sm text-muted-foreground">Loading profiles…</p> : profiles.error && !profiles.data ? <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-destructive/20 bg-destructive/5 p-4 text-sm"><span>{profiles.error.message}</span><Button size="sm" variant="outline" onClick={() => void profiles.refetch()}>Try again</Button></div> : profiles.data?.profiles.length ? <div className="space-y-3">{profiles.data.profiles.map((profile) => <ProfileCard key={profile.id} profile={profile} onEnabled={(enabled) => setEnabled.mutate({ id: profile.id, enabled })} onRefresh={() => verify.mutate(profile.id)} onOpen={() => open.mutate(profile.id)} onRemove={() => remove.mutate(profile.id)} />)}</div> : <p className="text-sm text-muted-foreground">No Letterboxd profiles connected yet.</p>}
-    </Section>
+  const dirty = Boolean(entry.trim() || additions.length || removals.length || enabledDraft && savedEnabled && !same(enabledDraft, savedEnabled))
+  return <div className="settings-page"><PageTitle title="Letterboxd" />
+    <fieldset disabled={save.isPending} className="min-w-0 space-y-5">
+      <legend className="sr-only">Letterboxd profiles</legend>
+      <Section title="Add profile" description="Profiles are verified and connected when you save.">
+        <form className="max-w-xl space-y-2" onSubmit={(event) => {
+          event.preventDefault()
+          setAdditions(queuedAdditions())
+          setEntry("")
+        }}>
+          <Label htmlFor="letterboxd-profile">Letterboxd username or profile URL</Label>
+          <p id="letterboxd-profile-help" className="text-sm text-muted-foreground">Enter a username or a profile URL such as https://letterboxd.com/username/.</p>
+          <div className="flex gap-2"><Input id="letterboxd-profile" aria-describedby="letterboxd-profile-help" value={entry} onChange={(event) => setEntry(event.target.value)} placeholder="Username or profile URL" /><Button disabled={!entry.trim() || !profiles.data}>Add profile</Button></div>
+        </form>
+        {additions.map((input) => <div key={input} className="flex items-center justify-between gap-3 rounded-md border p-3">
+          <div className="min-w-0"><p className="break-all">{input}</p><p className="text-sm text-muted-foreground">Will be added when you save</p></div>
+          <Button variant="ghost" onClick={() => setAdditions((current) => current.filter((added) => added !== input))} aria-label={`Cancel adding ${input}`}>Cancel</Button>
+        </div>)}
+      </Section>
+      <Section title="Connected profiles" description="Changes apply after Save. Discard restores the saved profiles.">
+        {profiles.isPending ? <p className="text-sm text-muted-foreground">Loading profiles…</p> : profiles.error && !profiles.data ? <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-destructive/20 bg-destructive/5 p-4 text-sm"><span>{profiles.error.message}</span><Button size="sm" variant="outline" onClick={() => void profiles.refetch()}>Try again</Button></div> : profiles.data?.profiles.length ? <div className="space-y-3">{profiles.data.profiles.map((profile) => removals.includes(profile.id)
+          ? <div key={profile.id} className="flex items-center justify-between gap-3 rounded-md border p-3"><div><p>{profile.displayName}</p><p className="text-sm text-muted-foreground">Will be removed when you save</p></div><Button variant="outline" aria-label={`Undo removal of ${profile.displayName}`} onClick={() => setRemovals((current) => current.filter((id) => id !== profile.id))}>Undo</Button></div>
+          : <ProfileCard key={profile.id} profile={{ ...profile, enabled: enabledDraft?.[profile.id] ?? profile.enabled }} onEnabled={(enabled) => { if (enabledDraft) setEnabledDraft({ ...enabledDraft, [profile.id]: enabled }) }} onRefresh={() => verify.mutate(profile.id)} onOpen={() => open.mutate(profile.id)} onRemove={() => setRemovals((current) => [...current, profile.id])} />)}</div> : <p className="text-sm text-muted-foreground">No Letterboxd profiles connected yet.</p>}
+      </Section>
+    </fieldset>
+    {save.error && <p role="alert" className="text-sm text-destructive">Could not save all changes. Your remaining edits are kept. {save.error.message}</p>}
+    <SaveBar
+      dirty={dirty}
+      saving={save.isPending}
+      saveDisabled={!profiles.data}
+      onSave={() => {
+        if (!enabledDraft) return
+        const pendingAdditions = queuedAdditions()
+        setAdditions(pendingAdditions)
+        setEntry("")
+        save.mutate({ enabled: enabledDraft, additions: pendingAdditions, removals })
+      }}
+      onDiscard={() => { clearPending(); setEnabledDraft(savedEnabled) }}
+      onReset={() => {
+        clearPending()
+        if (savedEnabled) setEnabledDraft(Object.fromEntries(Object.keys(savedEnabled).map((id) => [id, true])))
+      }}
+    />
   </div>
 }
 
@@ -836,7 +1233,7 @@ export function CompanionIntegration() {
     ? COMPANION_FEATURES.filter((feature) => capabilities.includes(feature.requires) && !capabilities.includes(feature.capability))
     : []
 
-  return <div className="settings-page"><PageTitle title="MediaFlick Companion" detail="Server-managed integrations available to this Jellyfin account." />
+  return <div className="settings-page"><PageTitle title="MediaFlick Companion" />
     <Section title="Plugin" description="Administrators configure these services in Jellyfin's MediaFlick Companion dashboard.">
       <SettingsRow title="Connection" description={pluginDescription}><Availability available={companion.available} /></SettingsRow>
     </Section>
@@ -891,5 +1288,6 @@ export function AppearanceSync() {
 }
 
 export default function Settings() {
-  return <div className="settings-layout"><SettingsNavigation /><main className="settings-main"><Routes><Route index element={<Navigate to="/settings/client/player" replace />} /><Route path="client/player" element={<PlayerSettings />} /><Route path="client/playback" element={<PlaybackSettings />} /><Route path="client/application" element={<ApplicationSettings />} /><Route path="appearance" element={<Appearance />} /><Route path="collections" element={<CollectionSettingsPage />} /><Route path="integrations/companion" element={<CompanionIntegration />} /><Route path="integrations/letterboxd" element={<Letterboxd />} /><Route path="*" element={<Navigate to="/settings" replace />} /></Routes></main></div>
+  const { data: status } = useStatus()
+  return <SettingsDraftGuard key={collectionAccountKey(status)}><div className="settings-layout"><SettingsNavigation /><main className="settings-main"><Routes><Route index element={<Navigate to="/settings/client/player" replace />} /><Route path="client/player" element={<PlayerSettings />} /><Route path="client/playback" element={<PlaybackSettings />} /><Route path="client/application" element={<ApplicationSettings />} /><Route path="viewing" element={<ViewingPreferences />} /><Route path="home" element={<HomeSettingsPage />} /><Route path="appearance" element={<Appearance />} /><Route path="collections" element={<CollectionSettingsPage />} /><Route path="integrations/companion" element={<CompanionIntegration />} /><Route path="integrations/letterboxd" element={<Letterboxd />} /><Route path="*" element={<Navigate to="/settings" replace />} /></Routes></main></div></SettingsDraftGuard>
 }

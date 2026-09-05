@@ -303,18 +303,70 @@ export function discoveryExternalLinksFor(
   return rottenTomatoes ? [...exactLinks, rottenTomatoes] : exactLinks
 }
 
-/**
- * `resume` begins as SQLite-backed Continue Watching. `/api/home/resume`
- * enriches it with live Next Up items independently, half-watched items first,
- * so the server request cannot hold the cached home page behind a skeleton.
- * The latest shelves are release-year ordered, unlike `recent`, which is
- * date-added ordered. `favorites` is assembled by the UI from the regular
- * items endpoint.
- */
+export type HomeBuiltInId =
+  | "watching"
+  | "becauseYouWatched"
+  | "recentlyAdded"
+  | "upcoming"
+  | "latestMovies"
+  | "latestShows"
+  | "myList"
+
+export type HomeElement = {
+  enabled: boolean
+  label: string
+  available: boolean
+  category: "Built-in" | "Genre" | "My Collection"
+} & (
+  | { kind: "builtIn"; id: HomeBuiltInId }
+  | { kind: "genre"; id: string }
+  | { kind: "collection"; id: string }
+)
+
+export interface HomeConfiguration {
+  billboard: boolean
+  watching: {
+    continueWatching: boolean
+    nextUp: boolean
+    combine: boolean
+  }
+  elements: HomeElement[]
+}
+
+export interface HomeSettingsResponse {
+  settings: HomeConfiguration
+  defaults: HomeConfiguration
+  collectionMode: CollectionMode
+}
+
+export type HomeSettingsWrite = Omit<HomeConfiguration, "elements"> & {
+  elements: Array<Pick<HomeElement, "kind" | "id" | "enabled">>
+}
+
+export function homeSettingsWrite(settings: HomeConfiguration): HomeSettingsWrite {
+  return {
+    billboard: settings.billboard,
+    watching: settings.watching,
+    elements: settings.elements.map(({ kind, id, enabled }) => ({ kind, id, enabled })),
+  }
+}
+
 export interface HomeRow {
-  id: "resume" | "recent" | "latest-movies" | "latest-shows" | "favorites"
+  kind: "builtIn" | "genre" | "collection"
+  id: string
   title: string
   items: ItemSummary[]
+}
+
+export interface HomeResponse {
+  configuration: HomeConfiguration
+  continueWatching: ItemSummary[]
+  rows: HomeRow[]
+}
+
+export interface HomeResumeResponse {
+  continueWatching: ItemSummary[]
+  nextUp: ItemSummary[]
 }
 
 interface LibraryStats {
@@ -427,10 +479,41 @@ export function playerSettingsWrite(settings: PlayerSettings): PlayerSettingsWri
   }
 }
 
+export interface ViewingSettings {
+  spoilerProtection: boolean
+  nextEpisode: "off" | "ask" | "auto"
+  countdownSeconds: number
+  episodeLimit: number
+  audioLanguages: string[]
+  subtitleLanguages: string[]
+  preferOriginalAudio: boolean
+  subtitleMode: "server" | "off" | "forced" | "always" | "foreignAudio"
+  resumeRewindSeconds: number
+  textScale: number
+  posterSize: number
+  previewDelayMs: number
+  startupDestination: "home" | "movies" | "series" | "calendar" | "last"
+  rememberFilters: boolean
+  hideWatched: boolean
+}
+
+export interface PlayerComfort {
+  subtitleSize: number
+  subtitleOutline: number
+  subtitleBackground: number
+  subtitlePosition: number
+  seekBackSeconds: number
+  seekForwardSeconds: number
+  pauseKey: string
+  muteKey: string
+  fullscreenKey: string
+}
+
 export interface ClientSettings {
   client: {
     player: PlayerSettings
     playback: {
+      comfort: PlayerComfort
       streamingQuality: StreamingQualityId
       skipIntro: SegmentSkipMode
       skipCredits: SegmentSkipMode
@@ -855,6 +938,7 @@ export interface CollectionProfileDraft {
   mediaType: CollectionMediaType
   limit: CollectionResultLimit
   cadence: RefreshCadence
+  availableOnHome: boolean
 }
 
 export interface CollectionProfile extends CollectionProfileDraft {
@@ -862,7 +946,7 @@ export interface CollectionProfile extends CollectionProfileDraft {
   revision: string
 }
 
-export interface CollectionTemplate extends Omit<CollectionProfileDraft, "template" | "customPosterId"> {
+export interface CollectionTemplate extends Omit<CollectionProfileDraft, "template" | "customPosterId" | "availableOnHome"> {
   id: string
   category: CollectionCategory
   pictogram: CollectionTemplatePictogram
@@ -1290,12 +1374,19 @@ function queryString<T>(params: { [K in keyof T]: QueryParameterValue }) {
 }
 
 export const api = {
+  viewing: () => request<ViewingSettings>("/api/settings/viewing"),
+  saveViewing: (value: ViewingSettings) => request<ViewingSettings>("/api/settings/viewing", { method: "PATCH", body: value }),
+  browsing: () => request<Record<string, string>>("/api/settings/browsing"),
+  saveBrowsing: (page: string, route: string) => request<{ saved: boolean }>("/api/settings/browsing", { method: "PATCH", body: { page, route } }),
   status: () => request<Status>("/api/status"),
   companion: {
     info: () => request<CompanionStatus>("/api/companion/info"),
     probe: () => request<CompanionStatus>("/api/companion/probe", { method: "POST" }),
   },
   settings: () => request<ClientSettings>("/api/settings"),
+  homeSettings: () => request<HomeSettingsResponse>("/api/settings/home"),
+  saveHomeSettings: (body: HomeSettingsWrite) =>
+    request<HomeSettingsResponse>("/api/settings/home", { method: "PATCH", body }),
   settingsPatch: {
     player: (body: PlayerSettingsWrite) =>
       request<ClientSettings>("/api/settings/client/player", { method: "PATCH", body }),
@@ -1383,8 +1474,8 @@ export const api = {
     }),
   logout: () => request<Status>("/api/auth/logout", { method: "POST" }),
 
-  home: () => request<{ rows: HomeRow[] }>("/api/home"),
-  homeResume: () => request<{ items: ItemSummary[] }>("/api/home/resume"),
+  home: () => request<HomeResponse>("/api/home"),
+  homeResume: () => request<HomeResumeResponse>("/api/home/resume"),
   billboard: () => request<{ items: ItemSummary[] }>("/api/billboard"),
   genres: () => request<{ genres: string[] }>("/api/genres"),
   resolvePerson: (query: PersonResolveQuery, signal?: AbortSignal) =>
@@ -1427,8 +1518,10 @@ export const api = {
     }),
 
   /** `quality` overrides the saved Settings default for this play only. */
-  play: (itemId: string, resume: boolean, quality?: StreamingQualityId) =>
-    request<PlayStarted>("/api/play", { method: "POST", body: { itemId, resume, quality } }),
+  play: (itemId: string, resume: boolean, quality?: StreamingQualityId) => {
+    window.dispatchEvent(new Event("mediaflick-manual-play"))
+    return request<PlayStarted>("/api/play", { method: "POST", body: { itemId, resume, quality } })
+  },
   changePlaybackQuality: (itemId: string, startTicks: number, quality: StreamingQualityId) =>
     request<PlayStarted>("/api/play", {
       method: "POST",

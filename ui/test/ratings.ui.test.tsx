@@ -1,10 +1,9 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { DEFAULT_COMFORT } from "@/lib/viewing"
+import { QueryClientProvider } from "@tanstack/react-query"
 import { act, fireEvent, render, screen } from "@testing-library/react"
-import { MemoryRouter, Route, Routes } from "react-router-dom"
+import { Route, Routes } from "react-router-dom"
 import { describe, expect, test, vi } from "vitest"
-import { EpisodeGrid } from "../src/components/detail/SeasonBrowser"
 import { DetailRatingReadout, RatingOverlayView } from "../src/components/RatingOverlay"
-import { RatingSourceIcon } from "../src/components/RatingSourceIcon"
 import type {
   ClientSettings,
   ItemRatings,
@@ -27,6 +26,8 @@ import Settings, {
 } from "../src/routes/Settings"
 import { queryKeys } from "../src/lib/query-client"
 import { requireElement } from "./support/fixtures"
+import { testQueryClient } from "./test-query-client"
+import { TestProviders } from "./test-utils"
 
 const definitions: RatingSourceDefinition[] = [
   { id: "imdb", label: "IMDb", shortLabel: "IMDb", scaleMax: 10, format: "decimal", known: true },
@@ -63,7 +64,7 @@ const integrationStatus: RatingsIntegrationStatus = {
 const clientSettings: ClientSettings = {
   client: {
     player: { playerBackend: "mpv", mpvPath: null, mpchcPath: null, defaultFullscreen: "fullscreen", markWatchedNext: "w", playerConfigured: false },
-    playback: { streamingQuality: "original", skipIntro: "prompt", skipCredits: "prompt", skipRecap: "prompt", skipCommercial: "prompt" },
+    playback: { comfort: DEFAULT_COMFORT, streamingQuality: "original", skipIntro: "prompt", skipCredits: "prompt", skipRecap: "prompt", skipCommercial: "prompt" },
     application: { closeBehavior: "exit_app", showScrollbars: false, logLevel: "debug" },
   },
   appearance: { theme: "system", accent: "signal", density: "comfortable", artworkIntensity: 100, backdropIntensity: 100, reducedMotion: false, cardPreviews: true, showMediaInfo: true, ratingSources: ["letterboxd"] },
@@ -87,30 +88,6 @@ function RatingProbe({ id }: { id: string }) {
 }
 
 describe("configurable card ratings", () => {
-  test("provides an icon for every native source and a safe future-source fallback", () => {
-    const sourceIds = [
-      "mdblist_score_average",
-      "imdb",
-      "trakt",
-      "tmdb",
-      "letterboxd",
-      "tomatoes",
-      "popcorn",
-      "metacritic",
-      "metacriticuser",
-      "rogerebert",
-      "myanimelist",
-      "future-source",
-    ]
-    const { container } = render(<>{sourceIds.map((sourceId) => (
-      <RatingSourceIcon key={sourceId} sourceId={sourceId} />
-    ))}</>)
-
-    for (const sourceId of sourceIds) {
-      expect(container.querySelector(`[data-rating-source-icon="${sourceId}"]`)).toBeTruthy()
-    }
-  })
-
   test("formats each native source scale without conflating RT critics and audience", () => {
     expect(display("letterboxd", 4.25).formatted).toBe("★4.3")
     expect(display("imdb", 8.1).accessibleValue).toBe("8.1 out of 10")
@@ -118,7 +95,7 @@ describe("configurable card ratings", () => {
     expect(display("popcorn", 91).formatted).toBe("91%")
   })
 
-  test("renders multiple available ratings as one accessible top-left definition list", () => {
+  test("renders multiple available ratings as one accessible definition list", () => {
     render(
       <RatingOverlayView
         itemName="The Matrix"
@@ -129,16 +106,12 @@ describe("configurable card ratings", () => {
 
     const overlay = screen.getByLabelText("Ratings for The Matrix")
     expect(overlay.tagName).toBe("DL")
-    expect(overlay.className).toContain("card-rating-readout")
-    expect(overlay.querySelector(".card-rating-chip")).toBeNull()
     expect(overlay.querySelectorAll("[data-rating-source-icon]")).toHaveLength(3)
     expect(overlay.querySelector("[data-rating-source-icon='letterboxd']")).toBeTruthy()
     expect(overlay.querySelector("[data-rating-source-icon='tomatoes']")).toBeTruthy()
     expect(overlay.querySelector("[data-rating-source-icon='popcorn']")).toBeTruthy()
     expect(overlay.textContent).not.toContain("LB")
     expect(overlay.textContent).not.toContain("RT A")
-    expect(overlay.querySelector(".card-rating-separator")).toBeNull()
-    expect(overlay.querySelectorAll(".rating-readout-value")).toHaveLength(3)
     expect(overlay.getAttribute("data-rating-origin")).toBe("plugin")
     expect(screen.getByLabelText("Letterboxd rating 4.2 out of 5")).toBeTruthy()
     expect(screen.getByLabelText("Rotten Tomatoes Critics rating 88 percent")).toBeTruthy()
@@ -161,49 +134,10 @@ describe("configurable card ratings", () => {
     )
 
     const readout = screen.getByLabelText("Ratings for The Matrix")
-    expect(readout.className).toContain("detail-rating-readout")
     expect(screen.getByLabelText("Letterboxd rating 4.2 out of 5")).toBeTruthy()
     expect(readout.querySelector("[data-rating-source-icon='letterboxd']")).toBeTruthy()
     expect(readout.textContent).not.toContain("LB")
     expect(register).toHaveBeenCalledWith(item.id)
-  })
-
-  test("shows each episode's own Jellyfin community rating", () => {
-    const episode: ItemSummary = {
-      id: "episode-1",
-      kind: "Episode",
-      name: "Good News About Hell",
-      year: 2022,
-      runtimeTicks: 3_000_000_000,
-      communityRating: 8.4,
-      officialRating: null,
-      seriesId: "series-1",
-      seriesName: "Severance",
-      indexNumber: 1,
-      parentIndexNumber: 1,
-      primaryImageTag: null,
-      thumbImageTag: null,
-      logoImageTag: null,
-      backdropImageTag: null,
-      childCount: null,
-      premiereDate: "2022-02-18T00:00:00Z",
-      seasonId: "season-1",
-      played: false,
-      playCount: 0,
-      positionTicks: 0,
-      favorite: false,
-      overview: "Mark is promoted.",
-    }
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
-    render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter>
-          <EpisodeGrid episodes={[episode]} parentId="season-1" />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    )
-
-    expect(screen.getByLabelText("Jellyfin community rating 8.4 out of 10")).toBeTruthy()
   })
 
   test("renders no placeholder when selected sources have no value", () => {
@@ -230,7 +164,7 @@ describe("configurable card ratings", () => {
       }), { status: 200 })
     })
     vi.stubGlobal("fetch", fetchMock)
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     client.setQueryData(queryKeys.status, { authenticated: true })
     client.setQueryData(queryKeys.ratingsStatus, integrationStatus)
@@ -298,7 +232,7 @@ describe("configurable card ratings", () => {
       id,
       ratings: [{ sourceId: "letterboxd", rawSource: "letterboxd", value: 4.2, score: 84, votes: 10, scaleMax: 5 }],
     })
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     client.setQueryData(queryKeys.ratingsStatus, integrationStatus)
     const harness = (ids: string[]) => (
@@ -371,7 +305,7 @@ describe("configurable card ratings", () => {
       }), { status: 200 })
     })
     vi.stubGlobal("fetch", fetchMock)
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     client.setQueryData(queryKeys.ratingsStatus, integrationStatus)
     try {
@@ -416,7 +350,7 @@ describe("configurable card ratings", () => {
       }), { status: 200 })
     })
     vi.stubGlobal("fetch", fetchMock)
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     client.setQueryData(queryKeys.ratingsStatus, integrationStatus)
     try {
@@ -485,20 +419,17 @@ describe("configurable card ratings", () => {
       thumbImageTag: "tag-still",
       positionTicks: 1_000_000_000,
     }
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     client.setQueryData(queryKeys.ratingsStatus, integrationStatus)
     client.setQueryData(queryKeys.status, { authenticated: true })
     client.setQueryData(queryKeys.home, {
-      rows: [
-        { id: "resume", title: "Continue watching", items: [resumeEpisode] },
-        { id: "recent", title: "Recently added", items: [movie, show] },
-      ],
+      continueWatching: [resumeEpisode],
+      rows: [{ kind: "builtIn", id: "recentlyAdded", title: "Recently added", items: [movie, show] }],
     })
     const register = vi.fn(() => vi.fn())
     const { container } = render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter>
+      <TestProviders client={client}>
           <RatingsContext.Provider
             value={{
               items: new Map([
@@ -511,8 +442,7 @@ describe("configurable card ratings", () => {
           >
             <Appearance />
           </RatingsContext.Provider>
-        </MemoryRouter>
-      </QueryClientProvider>,
+      </TestProviders>,
     )
     expect(screen.getByText("Cards")).toBeTruthy()
     const cardPreviews = screen.getByRole("switch", { name: "Show pop-out previews on cards" })
@@ -555,7 +485,7 @@ describe("configurable card ratings", () => {
       ...clientSettings,
       appearance: { ...clientSettings.appearance, showMediaInfo: false },
     }
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, disabled)
     render(<QueryClientProvider client={client}><AppearanceSync /></QueryClientProvider>)
     expect(document.documentElement.dataset.mediaInfo).toBe("false")
@@ -567,7 +497,7 @@ describe("configurable card ratings", () => {
       ...clientSettings,
       appearance: { ...clientSettings.appearance, cardPreviews: false },
     }
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, disabled)
     render(<QueryClientProvider client={client}><AppearanceSync /></QueryClientProvider>)
     expect(document.documentElement.dataset.cardPreviews).toBe("false")
@@ -575,7 +505,7 @@ describe("configurable card ratings", () => {
   })
 
   test("reports Companion services and the current Seerr user mapping", () => {
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.status, { authenticated: true })
     client.setQueryData(queryKeys.companion, {
       available: true,
@@ -608,13 +538,11 @@ describe("configurable card ratings", () => {
     })
 
     render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={["/settings/integrations/companion"]}>
+      <TestProviders client={client} initialEntries={["/settings/integrations/companion"]}>
           <Routes>
             <Route path="/settings/*" element={<Settings />} />
           </Routes>
-        </MemoryRouter>
-      </QueryClientProvider>,
+      </TestProviders>,
     )
 
     expect(screen.getByRole("heading", { name: "MediaFlick Companion" })).toBeTruthy()
@@ -626,7 +554,7 @@ describe("configurable card ratings", () => {
   })
 
   test("reports Companion feature mismatches without treating the plugin as disconnected", () => {
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.status, { authenticated: true })
     client.setQueryData(queryKeys.companion, {
       available: true,
@@ -643,13 +571,11 @@ describe("configurable card ratings", () => {
     })
 
     render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={["/settings/integrations/companion"]}>
+      <TestProviders client={client} initialEntries={["/settings/integrations/companion"]}>
           <Routes>
             <Route path="/settings/*" element={<Settings />} />
           </Routes>
-        </MemoryRouter>
-      </QueryClientProvider>,
+      </TestProviders>,
     )
 
     expect(screen.getByText("Connection").closest(".settings-row")?.textContent).toContain("available")

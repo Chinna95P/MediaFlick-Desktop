@@ -1,4 +1,5 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { DEFAULT_COMFORT } from "@/lib/viewing"
+import { QueryClientProvider } from "@tanstack/react-query"
 import { act, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import type { ClientSettings } from "../src/lib/api"
@@ -7,11 +8,12 @@ import { queryKeys } from "../src/lib/query-client"
 import { TechnicalProvider } from "../src/lib/technical"
 import { useCardTechnical } from "../src/lib/technical-context"
 import { parseJsonObject } from "./support/fixtures"
+import { testQueryClient } from "./test-query-client"
 
 const clientSettings: ClientSettings = {
   client: {
     player: { playerBackend: "mpv", mpvPath: null, mpchcPath: null, defaultFullscreen: "fullscreen", markWatchedNext: "w", playerConfigured: false },
-    playback: { streamingQuality: "original", skipIntro: "prompt", skipCredits: "prompt", skipRecap: "prompt", skipCommercial: "prompt" },
+    playback: { comfort: DEFAULT_COMFORT, streamingQuality: "original", skipIntro: "prompt", skipCredits: "prompt", skipRecap: "prompt", skipCommercial: "prompt" },
     application: { closeBehavior: "exit_app", showScrollbars: false, logLevel: "debug" },
   },
   appearance: { theme: "system", accent: "signal", density: "comfortable", artworkIntensity: 100, backdropIntensity: 100, reducedMotion: false, cardPreviews: true, showMediaInfo: true, ratingSources: [] },
@@ -59,7 +61,7 @@ describe("live card technical channel", () => {
     })
     vi.stubGlobal("fetch", fetchMock)
 
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     render(
       <QueryClientProvider client={client}>
@@ -98,7 +100,7 @@ describe("live card technical channel", () => {
     })
     vi.stubGlobal("fetch", fetchMock)
 
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     const view = (secondVisible: boolean) => (
       <QueryClientProvider client={client}>
@@ -144,7 +146,7 @@ describe("live card technical channel", () => {
     })
     vi.stubGlobal("fetch", fetchMock)
 
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     const view = (ids: string[]) => (
       <QueryClientProvider client={client}>
@@ -213,7 +215,7 @@ describe("live card technical channel", () => {
     })
     vi.stubGlobal("fetch", fetchMock)
 
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, clientSettings)
     render(
       <QueryClientProvider client={client}>
@@ -245,7 +247,7 @@ describe("live card technical channel", () => {
     const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }))
     vi.stubGlobal("fetch", fetchMock)
 
-    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } })
+    const client = testQueryClient()
     client.setQueryData(queryKeys.settings, {
       ...clientSettings,
       appearance: { ...clientSettings.appearance, showMediaInfo: false },
@@ -277,7 +279,7 @@ describe("live card technical channel", () => {
     })
     vi.stubGlobal("fetch", fetchMock)
 
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const client = testQueryClient()
     render(
       <QueryClientProvider client={client}>
         <TechnicalProvider>

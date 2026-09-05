@@ -1,6 +1,7 @@
 //! Process-wide services the app-scheme API reaches from CEF's background
 //! threads, where the UI-thread browser state is not available.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
 
@@ -43,6 +44,7 @@ pub struct Services {
     pub pending_deletions: Arc<PendingDeletionService>,
     pub preferences: Arc<PreferencesService>,
     pub shell: ShellBridge,
+    pub home_watched: Mutex<HashMap<AccountKey, Option<serde_json::Value>>>,
     playback: RwLock<Option<Arc<PlaybackCoordinator>>>,
 }
 
@@ -63,6 +65,11 @@ pub enum ShellRequest {
     },
     /// A committed cache mutation changed catalog rows.
     LibraryChanged {
+        item_ids: Vec<String>,
+        context_ids: Vec<String>,
+    },
+    /// A bootstrap page changed local catalog projections only.
+    CatalogChanged {
         item_ids: Vec<String>,
         context_ids: Vec<String>,
     },
@@ -129,7 +136,7 @@ impl Services {
 /// Opens the library database and restores the session. Safe to call twice;
 /// only the first call does the work.
 pub fn init() -> Option<Arc<Services>> {
-    init_with_settings(AppSettings::load())
+    services().or_else(|| init_with_settings(AppSettings::load()))
 }
 
 /// Same initialization path, with the already-normalized launch settings CEF
@@ -229,6 +236,7 @@ pub fn init_with_settings(initial_settings: AppSettings) -> Option<Arc<Services>
         pending_deletions,
         preferences,
         shell: ShellBridge::new(),
+        home_watched: Mutex::new(HashMap::new()),
         playback: RwLock::new(None),
     });
     resume_pending_deletions(&services);
@@ -400,6 +408,15 @@ pub fn notify_library_changed(changes: LibraryChangeBatch) {
     }
 }
 
+pub fn notify_catalog_changed(changes: LibraryChangeBatch) {
+    if let Some(services) = services() {
+        let _ = services.shell.request(ShellRequest::CatalogChanged {
+            item_ids: changes.item_ids,
+            context_ids: changes.context_ids,
+        });
+    }
+}
+
 pub fn notify_session_expired() {
     if let Some(services) = services() {
         let _ = services.shell.request(ShellRequest::SessionExpired);
@@ -414,6 +431,12 @@ pub fn notify_collections_changed() {
 
 pub fn notify_library_sync_completed() {
     if let Some(services) = services() {
+        // Refresh aggregate watch-state projections once after the full catalog
+        // observation, including user data learned during a daily rebootstrap.
+        let _ = services.shell.request(ShellRequest::LibraryChanged {
+            item_ids: Vec::new(),
+            context_ids: Vec::new(),
+        });
         crate::collections::scheduler::request_after_library_sync(services);
     }
 }

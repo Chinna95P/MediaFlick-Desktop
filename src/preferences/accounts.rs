@@ -3,11 +3,201 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::collections::valid_opaque_id;
 use crate::integrations::letterboxd::{ExternalProfile, MAX_CONNECTED_PROFILES};
 
-use super::AppearanceSettings;
+use super::{AppearanceSettings, ViewingSettings};
+
+const MAX_HOME_ELEMENTS: usize = 512;
+const PREFERRED_HOME_GENRES: [&str; 12] = [
+    "Action",
+    "Comedy",
+    "Drama",
+    "Science Fiction",
+    "Thriller",
+    "Documentary",
+    "Animation",
+    "Horror",
+    "Adventure",
+    "Crime",
+    "Fantasy",
+    "Romance",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HomeBuiltIn {
+    Watching,
+    BecauseYouWatched,
+    RecentlyAdded,
+    Upcoming,
+    LatestMovies,
+    LatestShows,
+    MyList,
+}
+
+impl HomeBuiltIn {
+    pub const ORDER: [Self; 7] = [
+        Self::Watching,
+        Self::BecauseYouWatched,
+        Self::RecentlyAdded,
+        Self::Upcoming,
+        Self::LatestMovies,
+        Self::LatestShows,
+        Self::MyList,
+    ];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum HomeElementId {
+    BuiltIn { id: HomeBuiltIn },
+    Genre { id: String },
+    Collection { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeElement {
+    #[serde(flatten)]
+    pub element: HomeElementId,
+    pub enabled: bool,
+}
+
+impl<'de> Deserialize<'de> for HomeElement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+        enum Wire {
+            BuiltIn { id: HomeBuiltIn, enabled: bool },
+            Genre { id: String, enabled: bool },
+            Collection { id: String, enabled: bool },
+        }
+
+        let (element, enabled) = match Wire::deserialize(deserializer)? {
+            Wire::BuiltIn { id, enabled } => (HomeElementId::BuiltIn { id }, enabled),
+            Wire::Genre { id, enabled } => (HomeElementId::Genre { id }, enabled),
+            Wire::Collection { id, enabled } => (HomeElementId::Collection { id }, enabled),
+        };
+        Ok(Self { element, enabled })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeWatchingSettings {
+    pub continue_watching: bool,
+    pub next_up: bool,
+    pub combine: bool,
+}
+
+impl Default for HomeWatchingSettings {
+    fn default() -> Self {
+        Self {
+            continue_watching: true,
+            next_up: true,
+            combine: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeSettings {
+    pub billboard: bool,
+    pub watching: HomeWatchingSettings,
+    pub elements: Vec<HomeElement>,
+}
+
+impl HomeSettings {
+    pub fn fresh(genres: &[String]) -> Self {
+        let mut ordered_genres = PREFERRED_HOME_GENRES
+            .iter()
+            .filter(|preferred| genres.iter().any(|genre| genre == **preferred))
+            .map(|genre| (*genre).to_string())
+            .collect::<Vec<_>>();
+        ordered_genres.extend(
+            genres
+                .iter()
+                .filter(|genre| !PREFERRED_HOME_GENRES.contains(&genre.as_str()))
+                .cloned(),
+        );
+        let mut elements = HomeBuiltIn::ORDER
+            .into_iter()
+            .map(|id| HomeElement {
+                element: HomeElementId::BuiltIn { id },
+                enabled: true,
+            })
+            .collect::<Vec<_>>();
+        elements.extend(
+            ordered_genres
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| HomeElement {
+                    element: HomeElementId::Genre { id },
+                    enabled: index < 6,
+                }),
+        );
+        Self {
+            billboard: true,
+            watching: HomeWatchingSettings::default(),
+            elements,
+        }
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        if self.elements.len() > MAX_HOME_ELEMENTS {
+            return Err(invalid_data(
+                "home configuration contains too many elements",
+            ));
+        }
+        let mut ids = HashSet::new();
+        for element in &self.elements {
+            if !ids.insert(element.element.clone()) {
+                return Err(invalid_data(
+                    "home configuration contains a duplicate element",
+                ));
+            }
+            match &element.element {
+                HomeElementId::BuiltIn { .. } => {}
+                HomeElementId::Genre { id }
+                    if id.trim().is_empty()
+                        || id.chars().count() > 100
+                        || id.chars().any(char::is_control) =>
+                {
+                    return Err(invalid_data("home configuration contains an invalid genre"));
+                }
+                HomeElementId::Collection { id } if !valid_opaque_id(id) => {
+                    return Err(invalid_data(
+                        "home configuration contains an invalid collection id",
+                    ));
+                }
+                HomeElementId::Genre { .. } | HomeElementId::Collection { .. } => {}
+            }
+        }
+        if HomeBuiltIn::ORDER
+            .into_iter()
+            .any(|id| !ids.contains(&HomeElementId::BuiltIn { id }))
+        {
+            return Err(invalid_data(
+                "home configuration is missing a built-in element",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn remove_collection(&mut self, profile_id: &str) {
+        self.elements.retain(|element| {
+            !matches!(&element.element, HomeElementId::Collection { id } if id == profile_id)
+        });
+    }
+}
+
 use super::json_file::{
     RecoveryNotice, load_with_recovery, replace_backup_with_primary, save_with_backup,
 };
@@ -50,6 +240,12 @@ struct AccountConfiguration {
     key: AccountKey,
     #[serde(default, skip_serializing_if = "AppearanceSettings::is_default")]
     appearance: AppearanceSettings,
+    #[serde(default)]
+    viewing: ViewingSettings,
+    #[serde(default)]
+    browsing: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home: Option<HomeSettings>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     letterboxd_profiles: Vec<ExternalProfile>,
 }
@@ -59,6 +255,9 @@ impl AccountConfiguration {
         Self {
             key,
             appearance: AppearanceSettings::default(),
+            viewing: ViewingSettings::default(),
+            browsing: std::collections::BTreeMap::new(),
+            home: None,
             letterboxd_profiles: Vec::new(),
         }
     }
@@ -132,6 +331,73 @@ impl AccountConfigurationService {
     ) -> io::Result<()> {
         self.mutate(|document| {
             account_mut(document, key).appearance = appearance.clone();
+            Ok(())
+        })
+    }
+
+    pub fn viewing(&self, key: &AccountKey) -> ViewingSettings {
+        self.with_document(|document| {
+            document
+                .accounts
+                .iter()
+                .find(|account| account.key == *key)
+                .map(|account| account.viewing.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    pub fn save_viewing(&self, key: &AccountKey, viewing: &ViewingSettings) -> io::Result<()> {
+        viewing.validate()?;
+        self.mutate(|document| {
+            account_mut(document, key).viewing = viewing.clone();
+            Ok(())
+        })
+    }
+
+    pub fn browsing(&self, key: &AccountKey) -> std::collections::BTreeMap<String, String> {
+        self.with_document(|document| {
+            document
+                .accounts
+                .iter()
+                .find(|account| account.key == *key)
+                .map(|account| account.browsing.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    pub fn save_browsing(&self, key: &AccountKey, page: &str, route: &str) -> io::Result<()> {
+        validate_browsing_route(page, route)?;
+        self.mutate(|document| {
+            account_mut(document, key)
+                .browsing
+                .insert(page.to_string(), route.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn home(&self, key: &AccountKey) -> Option<HomeSettings> {
+        self.with_document(|document| {
+            document
+                .accounts
+                .iter()
+                .find(|account| account.key == *key)
+                .and_then(|account| account.home.clone())
+        })
+    }
+
+    pub fn save_home(&self, key: &AccountKey, home: &HomeSettings) -> io::Result<()> {
+        home.validate()?;
+        self.mutate(|document| {
+            account_mut(document, key).home = Some(home.clone());
+            Ok(())
+        })
+    }
+
+    pub fn forget_home_collection(&self, key: &AccountKey, profile_id: &str) -> io::Result<()> {
+        self.mutate(|document| {
+            if let Some(home) = &mut account_mut(document, key).home {
+                home.remove_collection(profile_id);
+            }
             Ok(())
         })
     }
@@ -368,6 +634,13 @@ fn validate_document(document: &mut AccountConfigurationFile) -> io::Result<()> 
             ));
         }
         account.appearance.sanitize();
+        account.viewing.validate()?;
+        for (page, route) in &account.browsing {
+            validate_browsing_route(page, route)?;
+        }
+        if let Some(home) = &account.home {
+            home.validate()?;
+        }
         if account.letterboxd_profiles.len() > MAX_CONNECTED_PROFILES {
             return Err(invalid_data(
                 "account configuration contains too many Letterboxd profiles",
@@ -395,6 +668,26 @@ fn save_document(path: &Path, document: &AccountConfigurationFile) -> io::Result
 
 fn scrub_backup(path: &Path) -> io::Result<()> {
     replace_backup_with_primary(path)
+}
+
+fn validate_browsing_route(page: &str, route: &str) -> io::Result<()> {
+    let path = route.split('?').next().unwrap_or(route);
+    if !["last", "Movie", "Series"].contains(&page)
+        || route.len() > 2048
+        || !([
+            "/",
+            "/calendar",
+            "/library",
+            "/discover",
+            "/requests",
+            "/collections",
+        ]
+        .contains(&path)
+            || path.starts_with("/collections/"))
+    {
+        return Err(invalid_data("invalid browsing destination"));
+    }
+    Ok(())
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -454,6 +747,53 @@ mod tests {
     }
 
     #[test]
+    fn home_elements_reject_unknown_fields() {
+        let value = serde_json::json!({
+            "kind": "genre",
+            "id": "Drama",
+            "enabled": true,
+            "label": "not persisted"
+        });
+        assert!(serde_json::from_value::<HomeElement>(value).is_err());
+    }
+
+    #[test]
+    fn viewing_and_browsing_survive_reopen_and_reject_invalid_writes() {
+        let path = test_path("viewing-round-trip");
+        let alice = key("server", "alice");
+        let bob = key("server", "bob");
+        let service = AccountConfigurationService::open(path.clone()).expect("open");
+        let settings = ViewingSettings {
+            spoiler_protection: true,
+            audio_languages: vec!["en".into()],
+            ..Default::default()
+        };
+        service.save_viewing(&alice, &settings).expect("save");
+        service
+            .save_browsing(&alice, "Movie", "/library?kind=Movie&sort=year")
+            .expect("save browsing");
+        assert!(
+            service
+                .save_browsing(&alice, "last", "https://example.com")
+                .is_err()
+        );
+        let invalid = ViewingSettings {
+            text_scale: 0,
+            ..settings.clone()
+        };
+        assert!(service.save_viewing(&alice, &invalid).is_err());
+        drop(service);
+        let reopened = AccountConfigurationService::open(path).expect("reopen");
+        assert_eq!(reopened.viewing(&alice), settings);
+        assert_eq!(reopened.viewing(&bob), ViewingSettings::default());
+        assert!(reopened.browsing(&bob).is_empty());
+        assert_eq!(
+            reopened.browsing(&alice)["Movie"],
+            "/library?kind=Movie&sort=year"
+        );
+    }
+
+    #[test]
     fn account_settings_are_isolated_and_survive_reopen() {
         let path = test_path("round-trip");
         let alice = key("server", "alice");
@@ -470,16 +810,20 @@ mod tests {
         service
             .save_letterboxd_profile(&alice, &profile())
             .expect("save profile");
+        let home = HomeSettings::fresh(&["Action".to_owned(), "Comedy".to_owned()]);
+        service.save_home(&alice, &home).expect("save home");
         let saved_json = std::fs::read_to_string(&path).expect("read saved account settings");
         assert!(!saved_json.contains("jellyfinServerId"));
         assert!(!saved_json.contains("jellyfinUserId"));
 
         assert_eq!(service.appearance(&bob), AppearanceSettings::default());
         assert!(service.letterboxd_profiles(&bob).is_empty());
+        assert_eq!(service.home(&bob), None);
         drop(service);
 
         let reopened = AccountConfigurationService::open(path.clone()).expect("reopen");
         assert_eq!(reopened.appearance(&alice), appearance);
+        assert_eq!(reopened.home(&alice), Some(home));
         let profiles = reopened.letterboxd_profiles(&alice);
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].jellyfin_server_id, "server");

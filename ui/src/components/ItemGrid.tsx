@@ -53,7 +53,8 @@ function useGridMetrics(element: HTMLElement | null) {
     measure()
     const observer = new ResizeObserver(measure)
     observer.observe(element)
-    return () => observer.disconnect()
+    window.addEventListener("resize", measure)
+    return () => { observer.disconnect(); window.removeEventListener("resize", measure) }
   }, [element])
 
   return metrics
@@ -197,7 +198,7 @@ export function ItemGrid({
             {items.map((row) => (
               <div
                 key={row.key}
-                className="absolute top-0 left-0 flex w-full"
+                className="virtual-card-row absolute top-0 left-0 flex w-full"
                 style={{
                   height: cardHeight,
                   gap,

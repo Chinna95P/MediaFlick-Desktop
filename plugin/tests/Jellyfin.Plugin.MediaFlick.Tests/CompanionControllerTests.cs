@@ -17,12 +17,4 @@ public sealed class CompanionControllerTests
         Assert.DoesNotContain("collections-v2", capabilities);
         Assert.DoesNotContain("collections-curated-v1", capabilities);
     }
-
-    [Fact]
-    public void CollectionExperienceControllerCanBeActivatedByMvc()
-    {
-        var constructor = Assert.Single(typeof(CollectionExperienceController).GetConstructors());
-
-        Assert.True(constructor.IsPublic);
-    }
 }

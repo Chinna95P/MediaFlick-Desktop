@@ -11,6 +11,7 @@
 
 ### Added
 
+- Added account-owned Viewing settings for episode spoiler protection, next-episode mode and countdown, episode limits, preferred audio and subtitle languages, original-track preference, resume rewind, text and poster sizing, card-preview timing, startup destination, and remembered library filters. Built-in playback now has device-owned subtitle appearance with a preview, seek intervals, and shortcut keys. All preference controls use Save, Reset, and Discard; individual track choices retain priority.
 - Added integrated built-in playback on Windows. Bundled libmpv renders video beneath MediaFlick's CEF and DirectComposition controls in one native window, reports live playback, tracks, chapters, segments, and diagnostics, and supports seeking, volume, fullscreen, track selection, tuning, episode navigation, the configured mark-watched-next key, auto-hidden controls, and restored window placement. MediaFlick automatically detects SVP 4 and configures its VapourSynth and Python runtimes when available. Existing installations with an mpv path continue using external mpv, and `--mpv-path` explicitly selects it. Switching between built-in and external backends requires a restart.
 - Added a pinned, source-recording Windows libmpv cross-build. The release workflow produces a lean x86-64 DLL without mpv's command-line player, scripting, Vulkan, or GPL-only codec features, packages its notices and checksum, and publishes the corresponding source archive.
 - Added separate MediaFlick and Jellyfin collection modes. MediaFlick mode derives exact TMDB Movie Franchises, orders franchise titles by release date, and supports account-owned My Collections created from a packaged template catalog. Jellyfin mode reads existing BoxSets without modifying them.
@@ -19,6 +20,7 @@
 - Added strict TypeScript checks and Oxlint's built-in TypeScript and React rules for the UI.
 - Added pinned Rust checks with strict Clippy readability and ownership rules, rust-analyzer and Bacon diagnostics. Updated the project's Rust code and tests to pass without suppressions.
 - Added Latest Movies and Latest Shows after Recently Added on the home page. Each shelf sorts its catalog by release year and links to the matching newest-first library view.
+- Added account-scoped Home configuration with persistent shelf ordering and visibility, configurable Continue Watching and Next Up layout, per-genre shelves, stable Because You Watched recommendations, and opt-in My Collection shelves.
 - Added an in-app `/settings/*` area. Device-owned Client settings are available without an account, while Appearance, Letterboxd, Collections, and Companion status belong to the signed-in account. The sidebar links to Settings, forms keep local drafts, and fields support Save, Discard, and Reset. Typed PATCH endpoints share preferences with CEF, apply player, segment-skipping, and scrollbar changes at runtime, and return normalized settings with platform capabilities.
 - Added a read-only MediaFlick Companion integration page. It reports plugin compatibility, version, Seerr user mapping, and the availability of Seerr, Sonarr, Radarr, MDBList, and TMDB without exposing service addresses or credentials.
 - Added Appearance settings for system, dark, and light modes; signal, cobalt, amber, and violet accents; compact density; artwork and backdrop intensity; and reduced motion.
@@ -63,10 +65,21 @@
 
 ### Changed
 
+- Removed redundant episode-rating coverage, static UI smoke tests, trivial helper checks, and tests of framework defaults or removed settings; retained request, persistence, playback, and security regression coverage.
+
+- Reworked the subtitle preview with day, dusk, and night scenery, readable thick outlines, and positioning that keeps captions inside the frame.
+
+- Replaced free-form poster width with preset sizes and moved card-preview delay beside the Appearance preview toggle, sharing Save, Reset, Discard, and the live preview.
+- Removed page subtitles and promotional headings. Browsing pages now use plain names such as Discover, Requests, and Library.
+
+- Settings save bars now hide the accent outline and idle status text when there are no unsaved changes.
+- Simplified UI test setup, button and badge variants, updater metadata, Jellyfin response models, and Companion response buffering while preserving their behavior.
+- Pruned tautological and implementation-pinned tests, and made libmpv smoke tests explicitly opt-in instead of silently passing without a configured runtime.
 - Consolidated platform assets and packaging tools under `distribution/`, split generated packages between `dist/windows`, `dist/linux`, and `dist/macos`, grouped Companion source and tests under `plugin/src` and `plugin/tests`, and moved reusable CEF and libmpv downloads out of the checkout into user caches.
 - Licensed the project under GPL-2.0-or-later and added project and third-party notices to packaged releases. CI now lints, tests, and builds macOS and smoke-tests packages for all supported platforms.
 - Redesigned the project website around built-in and external playback, with responsive light-theme styling, accessible navigation, download links, and Cloudflare deployment.
 - Collection browsing now batches matching and library queries, virtualizes large title grids, prefetches collection routes, and loads franchise details from account-scoped snapshots.
+- Movie Franchises, My Collections, and titles inside My Collections now sort alphabetically without counting a leading "The", "A", or "An".
 - Redesigned the Companion plugin configuration page with compact service cards, responsive one-row connection controls, and grouped provider credentials.
 - Redesigned the backdrop treatment on all detail pages. Item, discovery, and collection pages now show one continuous full-bleed artwork behind the entire page — header, seasons, cast, and facts all scroll over it — cropped to fill and left visible to the page's end. Short pages stretch to the viewport so the art always reaches the window's bottom edge. A light even veil keeps sections readable and a soft fade protects the header text, replacing the stacked sharp-edged scrim layers and flat gray band below the artwork.
 - Collection pages now render movies already in the Jellyfin library with the standard local media card, including local artwork, watch progress, actions, technical details, and direct navigation to the local item. Missing collection entries keep the Seerr discovery and request card.
@@ -114,6 +127,16 @@
 
 ### Fixed
 
+- Fixed Linux and macOS CI builds by routing external mpv's watched-next hotkey through the shared player command and matching CEF's macOS cursor handle type.
+
+- Fixed mouse-wheel stutter in populated library and collection grids by compositing virtual rows and removing per-button background blur from inline card actions. Fixed the built-in Windows interface limiting scrolling to 60 fps on faster displays. GPU-backed CEF now follows the window's display refresh rate, rechecks display changes, and caps rendering at 240 fps. Sustained initial-sync pages now keep aggregate refreshes at one per second after the first page. Added per-page fetch and ingestion timings for real-server performance checks.
+
+- Reduced cached startup and initial-sync work: Home reads cached Companion availability, discovery requests are serialized, and the window reveals its usable route without waiting for artwork or invisible animations. Bootstrap bursts coalesce local refreshes without repeatedly fetching live Next Up; incomplete sync retries start at five seconds with bounded backoff and respect server retry delays. API calls reuse initialized settings, catalog writes reuse prepared statements and normalize each batch once, status reuses sync progress without repeated catalog counts, and the first poster write no longer prunes the image cache.
+
+- Protected unsaved Settings edits when navigating or refreshing data, kept Reset available before editing, staged Letterboxd additions and removals until Save, and labeled settings inputs and slider controls for assistive technology.
+- Fixed CI and release workflows failing validation while resolving CEF and libmpv cache paths by using workspace-relative cache paths available during job evaluation.
+- Fixed Home shelf drag handles in the windowless app shell by replacing Chromium's unsupported native drag transport with a pointer-following shelf preview and a reserved drop position. The accessible arrow controls remain available.
+- Fixed collection mode, franchise visibility, My Collections ordering, collection editing, and Letterboxd enablement bypassing the shared Save, Reset, and Discard workflow. The first Save for a new collection now previews it, and the second Save creates it.
 - Fixed Sonarr, Radarr, and Seerr status expiring 30 minutes after a successful request. Companion service health now follows the latest request outcome, and Desktop refreshes the status snapshot every five minutes while the app is active.
 - Fixed Companion settings treating plugin connectivity, upstream service health, and feature support as one status. Desktop now lists missing Companion features by name, keeps unaffected services available, and does not send Movie Franchise refresh requests unless the plugin advertises franchise membership support.
 - Fixed Companion-proxied Seerr posters failing at the `w92`, `w154`, `w185`, and `w300` renditions. Desktop now rejects error bodies before caching them, repairs invalid image-cache entries on access, and uses a new browser-cache URL so previously cached failures do not survive the update.

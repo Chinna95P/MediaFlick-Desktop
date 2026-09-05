@@ -9,12 +9,13 @@ use std::rc::Rc;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use cef::*;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow,
-    ScreenToClient,
+    ClientToScreen, DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW,
+    MONITOR_DEFAULTTONULL, MONITORINFO, MONITORINFOEXW, MonitorFromWindow, ScreenToClient,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -53,14 +54,10 @@ const DEFAULT_DPI: u32 = 96;
 const SYNC_INTERVAL_MS: i64 = 50;
 const VK_Q: WPARAM = b'Q' as WPARAM;
 const VK_V: WPARAM = b'V' as WPARAM;
-const KEY_LEFT: WPARAM = VK_LEFT as WPARAM;
-const KEY_RIGHT: WPARAM = VK_RIGHT as WPARAM;
 const KEY_UP: WPARAM = VK_UP as WPARAM;
 const KEY_DOWN: WPARAM = VK_DOWN as WPARAM;
 const CAPTURED_Q: u8 = 1;
 const CAPTURED_V: u8 = 1 << 1;
-const CAPTURED_LEFT: u8 = 1 << 2;
-const CAPTURED_RIGHT: u8 = 1 << 3;
 const CAPTURED_UP: u8 = 1 << 4;
 const CAPTURED_DOWN: u8 = 1 << 5;
 const CAPTURED_WATCHED_NEXT: u8 = 1 << 6;
@@ -130,6 +127,8 @@ pub(crate) struct PrototypeOsrSurface {
     input: Cell<HWND>,
     host_close_hooks: Cell<HostCloseHooks>,
     metrics: Cell<ViewMetrics>,
+    frame_rate: Cell<i32>,
+    display_checked_at: Cell<Instant>,
     window_settings: Cell<WebUiWindowSettings>,
     browser: RefCell<Option<Browser>>,
     compositor: RefCell<Option<Compositor>>,
@@ -156,6 +155,8 @@ impl PrototypeOsrSurface {
             input: Cell::new(null_mut()),
             host_close_hooks: Cell::new(HostCloseHooks::default()),
             metrics: Cell::new(ViewMetrics::from_logical_size(width, height)),
+            frame_rate: Cell::new(60),
+            display_checked_at: Cell::new(Instant::now()),
             window_settings: Cell::new(settings.webui_window),
             browser: RefCell::new(None),
             compositor: RefCell::new(None),
@@ -252,9 +253,11 @@ impl PrototypeOsrSurface {
         let cef_parent = sys::HWND(host.cast::<sys::HWND__>());
         let mut window_info = WindowInfo::default().set_as_windowless(cef_parent);
         window_info.shared_texture_enabled = 1;
+        let frame_rate = display_frame_rate(host);
+        self.frame_rate.set(frame_rate);
         let settings = BrowserSettings {
             background_color: 0,
-            windowless_frame_rate: 60,
+            windowless_frame_rate: frame_rate,
             ..BrowserSettings::default()
         };
         let url = CefString::from(app_scheme::APP_URL);
@@ -327,6 +330,13 @@ impl PrototypeOsrSurface {
         if input.is_null() || unsafe { IsWindow(input) } == 0 {
             self.close_browser();
             return false;
+        }
+        if self.display_checked_at.get().elapsed() >= Duration::from_secs(1) {
+            self.display_checked_at.set(Instant::now());
+            let rate = display_frame_rate(host);
+            if self.frame_rate.replace(rate) != rate {
+                self.with_browser_host(|browser_host| browser_host.set_windowless_frame_rate(rate));
+            }
         }
         self.capture_window_settings(host);
         let Some(metrics) = sample_metrics(host) else {
@@ -951,6 +961,34 @@ fn sample_window_settings(
     Some(settings)
 }
 
+fn display_frame_rate(host: HWND) -> i32 {
+    let monitor = unsafe { MonitorFromWindow(host, MONITOR_DEFAULTTONULL) };
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    let mut mode = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..DEVMODEW::default()
+    };
+    if monitor.is_null()
+        || unsafe { GetMonitorInfoW(monitor, &raw mut info.monitorInfo) } == 0
+        || unsafe {
+            EnumDisplaySettingsW(info.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &raw mut mode)
+        } == 0
+    {
+        return 60;
+    }
+    usable_frame_rate(mode.dmDisplayFrequency)
+}
+
+fn usable_frame_rate(frequency: u32) -> i32 {
+    // Windows uses 0 or 1 for an unspecified/default refresh rate.
+    if frequency <= 1 {
+        60
+    } else {
+        frequency.min(240) as i32
+    }
+}
+
 fn window_fills_monitor(host: HWND, window_rect: &RECT) -> bool {
     let monitor = unsafe { MonitorFromWindow(host, MONITOR_DEFAULTTONULL) };
     if monitor.is_null() {
@@ -1162,8 +1200,6 @@ fn key_event(message: u32, wparam: WPARAM, lparam: LPARAM) -> KeyEvent {
 enum PlaybackKey {
     Stop,
     ToggleSubtitles,
-    SeekBackTenSeconds,
-    SeekForwardTenSeconds,
     SeekBackThirtySeconds,
     SeekForwardThirtySeconds,
     MarkWatchedAndPlayNext,
@@ -1174,8 +1210,6 @@ impl PlaybackKey {
         match self {
             Self::Stop => CAPTURED_Q,
             Self::ToggleSubtitles => CAPTURED_V,
-            Self::SeekBackTenSeconds => CAPTURED_LEFT,
-            Self::SeekForwardTenSeconds => CAPTURED_RIGHT,
             Self::SeekBackThirtySeconds => CAPTURED_DOWN,
             Self::SeekForwardThirtySeconds => CAPTURED_UP,
             Self::MarkWatchedAndPlayNext => CAPTURED_WATCHED_NEXT,
@@ -1187,8 +1221,6 @@ impl PlaybackKey {
             Self::Stop => return PlayerCommand::Stop,
             Self::ToggleSubtitles => return PlayerCommand::ToggleSubtitleVisibility,
             Self::MarkWatchedAndPlayNext => return PlayerCommand::MarkWatchedAndPlayNext,
-            Self::SeekBackTenSeconds => -10_000.0,
-            Self::SeekForwardTenSeconds => 10_000.0,
             Self::SeekBackThirtySeconds => -30_000.0,
             Self::SeekForwardThirtySeconds => 30_000.0,
         };
@@ -1234,11 +1266,11 @@ fn playback_key(
     if !matches!(message, WM_KEYDOWN | WM_KEYUP | WM_CHAR) {
         return None;
     }
+    // Horizontal seeking belongs to the CEF player controls so saved intervals
+    // and focused input fields follow the same path as the toolbar buttons.
     match wparam {
         VK_Q | 0x71 => Some(PlaybackKey::Stop),
         VK_V | 0x76 => Some(PlaybackKey::ToggleSubtitles),
-        KEY_LEFT => Some(PlaybackKey::SeekBackTenSeconds),
-        KEY_RIGHT => Some(PlaybackKey::SeekForwardTenSeconds),
         KEY_DOWN => Some(PlaybackKey::SeekBackThirtySeconds),
         KEY_UP => Some(PlaybackKey::SeekForwardThirtySeconds),
         _ => None,
@@ -1415,6 +1447,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windowless_rendering_follows_display_refresh_with_a_bounded_fallback() {
+        for (reported, expected) in [
+            (0, 60),
+            (1, 60),
+            (60, 60),
+            (120, 120),
+            (144, 144),
+            (360, 240),
+        ] {
+            assert_eq!(super::usable_frame_rate(reported), expected);
+        }
+    }
+
+    #[test]
     fn saved_size_seeds_a_hidden_window_browser() {
         let metrics = ViewMetrics::from_logical_size(1280, 720);
 
@@ -1462,12 +1508,12 @@ mod tests {
             Some(PlaybackKey::Stop)
         );
         assert_eq!(
-            playback_key(WM_KEYDOWN, KEY_LEFT, no_modifiers, None),
-            Some(PlaybackKey::SeekBackTenSeconds)
+            playback_key(WM_KEYDOWN, VK_LEFT as WPARAM, no_modifiers, None),
+            None
         );
         assert_eq!(
-            playback_key(WM_KEYDOWN, KEY_RIGHT, no_modifiers, None),
-            Some(PlaybackKey::SeekForwardTenSeconds)
+            playback_key(WM_KEYDOWN, VK_RIGHT as WPARAM, no_modifiers, None),
+            None
         );
         assert_eq!(
             playback_key(WM_KEYDOWN, KEY_DOWN, no_modifiers, None),

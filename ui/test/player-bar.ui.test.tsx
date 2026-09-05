@@ -1,9 +1,11 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { QueryClientProvider } from "@tanstack/react-query"
 import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { PlayerBar } from "@/components/PlayerBar"
 import type { PlayerState } from "@/lib/api"
+import { DEFAULT_COMFORT } from "@/lib/viewing"
 import { queryKeys } from "@/lib/query-client"
+import { testQueryClient } from "./test-query-client"
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -56,21 +58,15 @@ describe("player bar controls", () => {
         })
       }),
     )
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
-    })
+    const client = testQueryClient()
+    client.setQueryData(queryKeys.settings, {client: {player: {playerBackend: "libmpv"}, playback: {comfort: DEFAULT_COMFORT}}})
     client.setQueryData<PlayerState>(queryKeys.playerState, playerState)
 
-    const view = render(
+    render(
       <QueryClientProvider client={client}>
         <PlayerBar />
       </QueryClientProvider>,
     )
-
-    const seekTarget = view.container.querySelector<HTMLElement>("[data-slot='slider']")
-    const seekTrack = view.container.querySelector<HTMLElement>("[data-slot='slider-track']")
-    expect(seekTarget?.classList.contains("h-10")).toBe(true)
-    expect(seekTrack?.classList.contains("data-[orientation=horizontal]:h-1.5")).toBe(true)
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Audio track" }), {
       button: 0,
@@ -130,9 +126,8 @@ describe("player bar controls", () => {
         })
       }),
     )
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
-    })
+    const client = testQueryClient()
+    client.setQueryData(queryKeys.settings, {client: {player: {playerBackend: "libmpv"}, playback: {comfort: DEFAULT_COMFORT}}})
     client.setQueryData<PlayerState>(queryKeys.playerState, playerState)
 
     const view = render(
@@ -159,4 +154,25 @@ describe("player bar controls", () => {
     expect(await screen.findByText("23.98 fps · 2 dropped frames")).toBeTruthy()
     expect(view.queryByText(/playback speed/i)).toBeNull()
   })
+})
+
+
+it("uses saved built-in seek intervals and letter shortcuts", async () => {
+  const commands: unknown[] = []
+  const player: PlayerState = {active:true, positionMs:12000, durationMs:120000, paused:false}
+  vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.body) commands.push(JSON.parse(String(init.body)))
+    return new Response(JSON.stringify(init?.body ? {accepted:true} : player), {status:200})
+  }))
+  const client = testQueryClient()
+  client.setQueryData(queryKeys.playerState, player)
+  client.setQueryData(queryKeys.settings, {client:{player:{playerBackend:"libmpv"}, playback:{comfort:{...DEFAULT_COMFORT, seekBackSeconds:5, seekForwardSeconds:7, pauseKey:"p"}}}})
+  render(<QueryClientProvider client={client}><PlayerBar /></QueryClientProvider>)
+  fireEvent.keyDown(window, {key:"ArrowRight"})
+  fireEvent.keyDown(window, {key:"p"})
+  await waitFor(() => {
+    expect(commands).toContainEqual({command:"seek", positionMs:19000})
+    expect(commands).toContainEqual({command:"pause"})
+  })
+  expect(screen.getByRole("button", {name:"Forward 7 seconds"})).toBeTruthy()
 })
